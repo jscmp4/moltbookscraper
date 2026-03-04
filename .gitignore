@@ -1,0 +1,35 @@
+﻿# Secrets
+.env
+*.env
+
+# Data outputs
+/data/
+/data/**
+
+# Python cache/build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE / local tooling
+.vscode/
+.claude/
+
+# Logs and temp
+*.log
+*.tmp
+
+# Local recovery / scratch files
+scraper_corrupted_*.py
+scraper_repaired.py
+scraper_restored.py
+scraper_wrapper_tmp.py
+scraper.cpython-*.py
