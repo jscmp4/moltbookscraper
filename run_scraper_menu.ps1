@@ -106,6 +106,67 @@ function Ask-CommentIdCache {
     }
 }
 
+function Ask-MinCommentsPreset {
+    param(
+        [int]$Default = 30
+    )
+    while ($true) {
+        Write-Host ""
+        Write-Host "min-comments preset (fetch comments where comment_count >= N):" -ForegroundColor DarkGray
+        Write-Host "  [1] 30 (recommended, fastest)"
+        Write-Host "  [2] 25 (broader)"
+        Write-Host "  [3] 20 (broader)"
+        Write-Host "  [4] 15 (broadest preset)"
+        Write-Host "  [5] custom N"
+        $defaultPick = switch ($Default) {
+            30 { "1" }
+            25 { "2" }
+            20 { "3" }
+            15 { "4" }
+            default { "5" }
+        }
+        $raw = Read-Host "pick 1-5, or input integer directly [$defaultPick]"
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            $raw = $defaultPick
+        }
+        $txt = $raw.Trim().ToLowerInvariant()
+        $n = 0
+        if ([int]::TryParse($txt, [ref]$n)) {
+            switch ($n) {
+                1 { return 30 }
+                2 { return 25 }
+                3 { return 20 }
+                4 { return 15 }
+                5 { return (Ask-Int "custom min-comments N" $Default 0) }
+                default {
+                    if ($n -ge 0) { return $n }
+                }
+            }
+        }
+        switch ($txt) {
+            "recommended" { return 30 }
+            "fast" { return 30 }
+            "broad" { return 20 }
+            "custom" { return (Ask-Int "custom min-comments N" $Default 0) }
+        }
+        Write-Host "Please input 1-5 or an integer >= 0" -ForegroundColor Yellow
+    }
+}
+
+function Run-IncrementalPreset {
+    $minComments = Ask-MinCommentsPreset 30
+    $workers = Ask-Int "workers" 1 1
+    $commentRpm = Ask-Int "comment-rpm" 38 1
+    Invoke-Scraper -ArgsList @(
+        "--workers", "$workers",
+        "--comment-rpm", "$commentRpm",
+        "--min-comments", "$minComments",
+        "--comment-queue-strategy", "layered",
+        "--comment-id-cache", "sqlite",
+        "--no-snapshot"
+    )
+}
+
 function Run-Custom {
     $workers = Ask-Int "workers" 1 1
     $readRpm = Ask-Int "read-rpm" 40 1
@@ -148,7 +209,7 @@ function Run-Custom {
 }
 
 function Run-CommentsGapBackfill {
-    $minComments = Ask-Int "min-comments threshold (comment_count >= N)" 30 0
+    $minComments = Ask-MinCommentsPreset 30
     $maxCommentPosts = Ask-Int "max-comment-posts this run (0 = unlimited)" 0 0
     $workers = Ask-Int "workers" 1 1
     $commentRpm = Ask-Int "comment-rpm" 38 1
@@ -301,8 +362,8 @@ function Select-MenuItem {
 $menu = @(
     @{
         Name = "Incremental (recommended)"
-        Desc = "posts incremental + comments gap-backfill (>=30), layered queue, 1 worker"
-        Run  = { Invoke-Scraper -ArgsList @("--workers", "1", "--min-comments", "30", "--comment-queue-strategy", "layered", "--comment-id-cache", "sqlite", "--no-snapshot") }
+        Desc = "posts incremental + comments gap-backfill (threshold preset: 30/25/20/15/custom)"
+        Run  = { Run-IncrementalPreset }
     },
     @{
         Name = "Only Posts Incremental"
@@ -311,7 +372,7 @@ $menu = @(
     },
     @{
         Name = "Comments Gap Backfill"
-        Desc = "comments-only gap-backfill (skip posts); supports layered queue"
+        Desc = "comments-only gap-backfill (threshold preset: 30/25/20/15/custom)"
         Run  = { Run-CommentsGapBackfill }
     },
     @{
