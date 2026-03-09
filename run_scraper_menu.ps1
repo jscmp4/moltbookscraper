@@ -221,7 +221,7 @@ function Run-CommentsGapBackfill {
         $queueSmallMax = Ask-Int "queue-small-max (small <= N)" 80 1
         $queueMediumMax = Ask-Int "queue-medium-max (medium <= N, must > small)" 400 ($queueSmallMax + 1)
     }
-    $useNoResume = Ask-YesNo "ignore saved resume cursor (--no-resume)" $true
+    $useNoResume = Ask-YesNo "ignore saved resume cursor (--no-resume, usually NO for layered reruns)" $false
 
     $args = @("--workers", "$workers", "--comment-rpm", "$commentRpm", "--min-comments", "$minComments", "--comments-only", "--no-snapshot", "--comment-queue-strategy", "$queueStrategy", "--comment-id-cache", "$commentIdCache")
     if ($maxCommentPosts -gt 0) {
