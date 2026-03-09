@@ -70,12 +70,56 @@ function Ask-YesNo {
     }
 }
 
+function Ask-QueueStrategy {
+    param(
+        [string]$Default = "layered"
+    )
+    $valid = @("layered", "small-first", "large-first")
+    while ($true) {
+        $raw = Read-Host "comment-queue-strategy [layered/small-first/large-first] [$Default]"
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return $Default
+        }
+        $v = $raw.Trim().ToLowerInvariant()
+        if ($valid -contains $v) {
+            return $v
+        }
+        Write-Host "Please input one of: layered, small-first, large-first" -ForegroundColor Yellow
+    }
+}
+
+function Ask-CommentIdCache {
+    param(
+        [string]$Default = "memory"
+    )
+    $valid = @("memory", "sqlite")
+    while ($true) {
+        $raw = Read-Host "comment-id-cache [memory/sqlite] [$Default]"
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return $Default
+        }
+        $v = $raw.Trim().ToLowerInvariant()
+        if ($valid -contains $v) {
+            return $v
+        }
+        Write-Host "Please input one of: memory, sqlite" -ForegroundColor Yellow
+    }
+}
+
 function Run-Custom {
     $workers = Ask-Int "workers" 1 1
     $readRpm = Ask-Int "read-rpm" 40 1
     $commentRpm = Ask-Int "comment-rpm" 38 1
     $minComments = Ask-Int "min-comments" 30 0
     $maxCommentPosts = Ask-Int "max-comment-posts (0 = unlimited)" 0 0
+    $queueStrategy = Ask-QueueStrategy "layered"
+    $commentIdCache = Ask-CommentIdCache "memory"
+    $queueSmallMax = 80
+    $queueMediumMax = 400
+    if ($queueStrategy -eq "layered") {
+        $queueSmallMax = Ask-Int "queue-small-max (small <= N)" 80 1
+        $queueMediumMax = Ask-Int "queue-medium-max (medium <= N, must > small)" 400 ($queueSmallMax + 1)
+    }
     $useNoSnapshot = Ask-YesNo "disable auto snapshot (--no-snapshot)" $true
     $useFull = Ask-YesNo "run full mode (--full)" $false
     $useCommentsOnly = Ask-YesNo "comments-only mode (--comments-only)" $false
@@ -87,9 +131,12 @@ function Run-Custom {
         return
     }
 
-    $args = @("--workers", "$workers", "--read-rpm", "$readRpm", "--comment-rpm", "$commentRpm", "--min-comments", "$minComments")
+    $args = @("--workers", "$workers", "--read-rpm", "$readRpm", "--comment-rpm", "$commentRpm", "--min-comments", "$minComments", "--comment-queue-strategy", "$queueStrategy", "--comment-id-cache", "$commentIdCache")
     if ($maxCommentPosts -gt 0) {
         $args += @("--max-comment-posts", "$maxCommentPosts")
+    }
+    if ($queueStrategy -eq "layered") {
+        $args += @("--queue-small-max", "$queueSmallMax", "--queue-medium-max", "$queueMediumMax")
     }
     if ($useNoSnapshot) { $args += "--no-snapshot" }
     if ($useFull) { $args += "--full" }
@@ -105,11 +152,22 @@ function Run-CommentsGapBackfill {
     $maxCommentPosts = Ask-Int "max-comment-posts this run (0 = unlimited)" 0 0
     $workers = Ask-Int "workers" 1 1
     $commentRpm = Ask-Int "comment-rpm" 38 1
+    $queueStrategy = Ask-QueueStrategy "layered"
+    $commentIdCache = Ask-CommentIdCache "sqlite"
+    $queueSmallMax = 80
+    $queueMediumMax = 400
+    if ($queueStrategy -eq "layered") {
+        $queueSmallMax = Ask-Int "queue-small-max (small <= N)" 80 1
+        $queueMediumMax = Ask-Int "queue-medium-max (medium <= N, must > small)" 400 ($queueSmallMax + 1)
+    }
     $useNoResume = Ask-YesNo "ignore saved resume cursor (--no-resume)" $true
 
-    $args = @("--workers", "$workers", "--comment-rpm", "$commentRpm", "--min-comments", "$minComments", "--comments-only", "--no-snapshot")
+    $args = @("--workers", "$workers", "--comment-rpm", "$commentRpm", "--min-comments", "$minComments", "--comments-only", "--no-snapshot", "--comment-queue-strategy", "$queueStrategy", "--comment-id-cache", "$commentIdCache")
     if ($maxCommentPosts -gt 0) {
         $args += @("--max-comment-posts", "$maxCommentPosts")
+    }
+    if ($queueStrategy -eq "layered") {
+        $args += @("--queue-small-max", "$queueSmallMax", "--queue-medium-max", "$queueMediumMax")
     }
     if ($useNoResume) { $args += "--no-resume" }
 
@@ -243,8 +301,8 @@ function Select-MenuItem {
 $menu = @(
     @{
         Name = "Incremental (recommended)"
-        Desc = "posts incremental + comments gap-backfill (>=30), 1 worker, no snapshot"
-        Run  = { Invoke-Scraper -ArgsList @("--workers", "1", "--min-comments", "30", "--no-snapshot") }
+        Desc = "posts incremental + comments gap-backfill (>=30), layered queue, 1 worker"
+        Run  = { Invoke-Scraper -ArgsList @("--workers", "1", "--min-comments", "30", "--comment-queue-strategy", "layered", "--comment-id-cache", "sqlite", "--no-snapshot") }
     },
     @{
         Name = "Only Posts Incremental"
@@ -253,13 +311,25 @@ $menu = @(
     },
     @{
         Name = "Comments Gap Backfill"
-        Desc = "comments-only gap-backfill (skip posts); optional --no-resume"
+        Desc = "comments-only gap-backfill (skip posts); supports layered queue"
         Run  = { Run-CommentsGapBackfill }
     },
     @{
         Name = "Data Check"
-        Desc = "run built-in data health check"
-        Run  = { Invoke-Scraper -ArgsList @("--check") }
+        Desc = "run data health check with configurable eligible threshold"
+        Run  = {
+            $minComments = Ask-Int "check min-comments threshold (comment_count >= N)" 30 0
+            $fastCheck = Ask-YesNo "fast check mode (skip strict comment audit, use cached comment metrics)" $false
+            $args = @("--check", "--min-comments", "$minComments")
+            if ($fastCheck) {
+                $args += "--check-fast"
+                $samplePosts = Ask-Int "fast check sample-posts for strict audit (0 = disable)" 300 0
+                if ($samplePosts -gt 0) {
+                    $args += @("--check-sample-posts", "$samplePosts")
+                }
+            }
+            Invoke-Scraper -ArgsList $args
+        }
     },
     @{
         Name = "Dedup Comments"
@@ -268,7 +338,7 @@ $menu = @(
     },
     @{
         Name = "Refetch High-Comment Posts"
-        Desc = "remove done-cache marks for posts with comment_count >= N"
+        Desc = "force retry comments for posts >= N (reset done/resume/cooldown state)"
         Run  = {
             $n = Ask-Int "refetch threshold N (comment_count >= N)" 30 1
             Invoke-Scraper -ArgsList @("--refetch-comments", "$n")
