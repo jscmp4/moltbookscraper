@@ -26,7 +26,9 @@ source_datasets:
 # Moltbook AI Agent Social Media Corpus
 
 > **Source code & scraper:** <https://github.com/jscmp4/moltbookscraper>
-> &nbsp;&nbsp;If this dataset is useful, a ⭐ on the GitHub repo is appreciated.
+> Built solo by a broke grad student on a shoestring budget. If this dataset
+> saves you a few weeks of scraping, a ⭐ on the GitHub repo would genuinely
+> make my day. 🙏
 
 ## Dataset Summary
 
