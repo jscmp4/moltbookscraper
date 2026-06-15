@@ -1,28 +1,29 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
-Moltbook Data Scraper  鈥? v2 (incremental + checkpoint + progress bar)
+Moltbook Data Scraper - v2 (incremental + checkpoint + progress bar)
 Collects posts, comments, submolts, and agent profiles from moltbook.com API
 for sociology research on AI agents.
 
 Usage:
-    python -X utf8 scraper.py                  # 澧為噺鎶撳彇锛堝彧鎶撲笂娆′互鏉ョ殑鏂板笘瀛愶級
-    python -X utf8 scraper.py --full           # 鍏ㄩ噺鎶撳彇鎵€鏈夊巻鍙插笘瀛?
-    python -X utf8 scraper.py --no-comments    # 璺宠繃璇勮锛堟洿蹇級
-    python -X utf8 scraper.py --max-posts 500  # 闄愬埗甯栧瓙鏁伴噺
-    python -X utf8 scraper.py --reset          # 娓呯┖ checkpoint锛岄噸鏂板叏閲忔姄
-    python -X utf8 scraper.py --clean-runs     # 鍒犻櫎 data/runs/ 蹇収閲婃斁纾佺洏锛堝彲鍔犳暟瀛椾繚鐣欐渶杩慛涓級
-    python -X utf8 scraper.py --check          # 鏁版嵁鑷
+    python -X utf8 scraper.py                  # incremental run
+    python -X utf8 scraper.py --full           # full historical crawl
+    python -X utf8 scraper.py --no-comments    # posts only
+    python -X utf8 scraper.py --max-posts 500  # limit new posts this run
+    python -X utf8 scraper.py --reset          # reset checkpoint then run
+    python -X utf8 scraper.py --clean-runs     # clean data/runs snapshots
+    python -X utf8 scraper.py --check          # data health check
 
-NOTE: 鍦?Windows 涓婂繀椤荤敤 `python -X utf8` 杩愯锛岄伩鍏?emoji 缂栫爜閿欒銆?
+NOTE:
+    On Windows, run with `python -X utf8` to avoid console encoding issues.
 
-鏁版嵁淇濆瓨浣嶇疆:
-    data/posts_all.jsonl            鈫?绱Н鐨勫叏閮ㄥ笘瀛愶紙姣忓ぉ杩藉姞锛屽幓閲嶏級
-    data/comments_all.jsonl         鈫?绱Н鐨勫叏閮ㄨ瘎璁?
-    data/comments_done_posts.txt    鈫?宸叉姄瀹岃瘎璁虹殑 post_id 鍒楄〃锛堝揩閫熸柇鐐圭画浼犵紦瀛橈級
-    data/submolts.json              鈫?绀惧尯鍒楄〃锛堟瘡娆¤繍琛屾洿鏂帮級
-    data/agents_seen.jsonl          鈫?瑙佽繃鐨?agent 妗ｆ锛堝幓閲嶏級
-    data/checkpoint.json            鈫?鏂偣鐘舵€侊紙杩愯璁板綍 + cursor锛?
-    data/runs/YYYYMMDD_*.jsonl      鈫?姣忔杩愯鐨勫閲忔暟鎹紙鍙敤 --clean-runs 娓呯悊锛?
+Data files:
+    data/posts_all.jsonl
+    data/comments_all.jsonl
+    data/comments_done_posts.txt
+    data/submolts.json
+    data/agents_seen.jsonl
+    data/checkpoint.json
+    data/runs/YYYYMMDD_*.jsonl
 """
 
 import requests
@@ -30,8 +31,12 @@ import json
 import time
 import argparse
 import sys
+import os
+import atexit
 import threading
 import random
+import hashlib
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, date as date_type, timedelta
 from collections import Counter
@@ -45,10 +50,18 @@ if sys.platform == "win32":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 BASE_URL = "https://www.moltbook.com/api/v1"
-HEADERS = {"User-Agent": "MoltbookResearchScraper/2.0 (sociology research)"}
+HEADERS = {"User-Agent": "AcademicResearchBot/2.0 (computational social science)"}
 
-# 鈹€鈹€ API key锛堝彲閫夛級鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-# 浠?.env 鏂囦欢鎴栫幆澧冨彉閲忚鍙栵紝鏈?key 鍒欑敤璁よ瘉璇锋眰
+# Set when auth is dead platform-wide; checked by both stages so a dead key
+# aborts the run instead of burning hours of futile per-post retries.
+# 401 sets it immediately; 403 only after 3 CONSECUTIVE failures, because a
+# single deleted/private post legitimately 403s without the key being dead.
+_FATAL_AUTH_EVENT = threading.Event()
+_auth_403_streak = 0
+_auth_403_lock = threading.Lock()
+
+# API key
+# ?.env ?key
 def _load_api_key() -> str:
     import os
     key = os.environ.get("MOLTBOOK_API_KEY", "")
@@ -64,20 +77,17 @@ def _load_api_key() -> str:
         HEADERS["Authorization"] = f"Bearer {key}"
     return key
 
-_load_api_key()  # 鍓綔鐢細濡傛灉鏈?key锛屾敞鍏?HEADERS["Authorization"]
+_load_api_key()  # ?key?HEADERS["Authorization"]
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-# RATE LIMITER  (绾跨▼瀹夊叏锛屽叏灞€鍏变韩)
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+#
+# RATE LIMITER ()
+#
 
 class RateLimiter:
-    """
-    Token bucket 閫熺巼闄愬埗鍣ㄣ€傚绾跨▼鍏辩敤鍚屼竴涓疄渚嬶紝淇濊瘉鍏ㄥ眬涓嶈秴杩?max_per_minute銆?
-    姣忔 .wait() 璋冪敤浼氬湪蹇呰鏃堕樆濉烇紝纭繚璇锋眰闂撮殧鍚堣銆?
-    """
+    """Thread-safe rate limiter shared across workers."""
     def __init__(self, max_per_minute=90):
-        self._interval = 60.0 / max_per_minute  # 鏈€灏忚姹傞棿闅旓紙绉掞級
+        self._interval = 60.0 / max_per_minute  #
         self._lock = threading.Lock()
         self._last = 0.0
 
@@ -97,23 +107,29 @@ class RateLimiter:
 
 _DEFAULT_READ_RPM = 40
 _DEFAULT_COMMENT_RPM = 38
+_DEFAULT_COMMENT_QUEUE_STRATEGY = "layered"
+_DEFAULT_QUEUE_SMALL_MAX = 80
+_DEFAULT_QUEUE_MEDIUM_MAX = 400
+_DEFAULT_POST_ZERO_STREAK_GUARD = 300
+_DEFAULT_POST_MAX_RECOVER_RETRIES = 6
+_DEFAULT_COMMENT_ID_CACHE_MODE = "memory"
 _rate_limiter          = RateLimiter(max_per_minute=_DEFAULT_READ_RPM)      # GET endpoints
 _rate_limiter_comments = RateLimiter(max_per_minute=_DEFAULT_COMMENT_RPM)   # comments endpoints, slightly more conservative
 
-# 鍏ㄥ眬鐔旀柇锛氫换浣曠嚎绋嬭Е鍙?429 鍚庤缃鏃堕棿鎴筹紝鍏朵粬绾跨▼绛夊埌璇ユ椂闂存墠缁х画
+# ?429
 _global_cooldown_until = 0.0
 _global_cooldown_lock  = threading.Lock()
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+#
 # HTTP
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+#
 
 def _countdown(seconds: float):
-    """绛夊緟鏈熼棿姣?10 绉掓墦鍗颁竴娆″€掕鏃讹紝璁╃敤鎴风煡閬撶▼搴忚繕鍦ㄨ繍琛屻€?"""
+    """Print remaining wait time every 10s so progress is visible."""
     remaining = int(seconds)
     while remaining > 0:
-        tqdm.write(f"  [绛夊緟] 杩樺墿 {remaining}s...")
+        tqdm.write(f"  [wait] {remaining}s remaining...")
         chunk = min(10, remaining)
         time.sleep(chunk)
         remaining -= chunk
@@ -124,6 +140,18 @@ def _to_int(value, default=0):
         return int(float(value))
     except Exception:
         return default
+
+
+def _id_fingerprint(value: str) -> int:
+    """Stable 64-bit fingerprint used for in-memory dedup sets."""
+    raw = str(value).encode("utf-8", errors="ignore")
+    return int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big")
+
+
+def _pair_fingerprint(a: str, b: str) -> int:
+    """Stable 64-bit fingerprint for (post_id, comment_id) pair."""
+    raw = f"{a}|{b}".encode("utf-8", errors="ignore")
+    return int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big")
 
 
 def _retry_after_seconds(resp, body=None):
@@ -164,24 +192,24 @@ def _retry_after_seconds(resp, body=None):
 
 
 def api_get(endpoint, params=None, retries=3, skip_on_ratelimit=False):
-    global _global_cooldown_until
+    global _global_cooldown_until, _auth_403_streak
     url = f"{BASE_URL}{endpoint}"
     limiter = _rate_limiter_comments if endpoint.endswith("/comments") else _rate_limiter
     for attempt in range(retries):
-        # 鍏ㄥ眬鐔旀柇锛氳嫢鍏朵粬绾跨▼瑙﹀彂浜?429锛岀瓑鍒板喎鍗存湡缁撴潫
+        # Global cooldown: if another worker hit 429, wait here.
         now = time.time()
         with _global_cooldown_lock:
             cooldown_remaining = _global_cooldown_until - now
         if cooldown_remaining > 0:
             if cooldown_remaining >= 1:
-                tqdm.write(f"  [鍏ㄥ眬鍐峰嵈] 绛?{cooldown_remaining:.0f}s...")
+                tqdm.write(f"  [global cooldown] wait {cooldown_remaining:.0f}s...")
             time.sleep(cooldown_remaining)
 
-        limiter.wait()  # 绾跨▼瀹夊叏鑺傛祦锛岃瘎璁烘帴鍙ｇ敤鐙珛闄愰€熷櫒
+        limiter.wait()  # thread-safe throttling
         try:
-            r = requests.get(url, params=params, headers=HEADERS, timeout=15)
+            r = requests.get(url, params=params, headers=HEADERS, timeout=30)
 
-            # 璇绘湇鍔″櫒杩斿洖鐨勭湡瀹為檺閫熷ご锛屽揩鍒颁笂闄愭椂涓诲姩绛夊埌绐楀彛閲嶇疆
+            # Honor server rate-limit headers before hard 429.
             remaining = _to_int(r.headers.get("X-RateLimit-Remaining", 999), 999)
             reset_ts  = _to_int(r.headers.get("X-RateLimit-Reset", 0), 0)
             rl_limit  = _to_int(r.headers.get("X-RateLimit-Limit", 0), 0)
@@ -190,13 +218,13 @@ def api_get(endpoint, params=None, retries=3, skip_on_ratelimit=False):
                 tqdm.write(f"  [rl] remaining={remaining}/{rl_limit}  reset_in={window_s}s")
             if remaining <= 15 and r.status_code != 429:
                 wait = max(65, reset_ts - time.time() + 2)
-                tqdm.write(f"  [rate limit] 鍓╀綑 {remaining} 娆★紝绛?{wait:.0f}s 鍒扮獥鍙ｉ噸缃?..")
+                tqdm.write(f"  [rate limit] remaining={remaining}, wait {wait:.0f}s for reset...")
                 with _global_cooldown_lock:
                     _global_cooldown_until = max(_global_cooldown_until, time.time() + wait)
                 time.sleep(wait)
 
             if r.status_code == 429:
-                # 浼樺厛浣跨敤鏈嶅姟绔彁渚涚殑 retry-after / reset 淇℃伅锛涢兘娌℃湁鏃跺啀鎸囨暟閫€閬?+ jitter
+                # Prefer server retry-after/reset, then exponential backoff + jitter.
                 body = None
                 try:
                     body = r.json()
@@ -215,13 +243,29 @@ def api_get(endpoint, params=None, retries=3, skip_on_ratelimit=False):
                 if skip_on_ratelimit:
                     tqdm.write(f"  [rate limit] {endpoint} limited, skip (cooldown {wait:.0f}s)")
                     return None
-                tqdm.write(f"  [rate limit 429] attempt={attempt+1}锛岀瓑 {wait:.0f}s 鍚庨噸璇?..")
+                tqdm.write(f"  [rate limit 429] attempt={attempt+1}, retry in {wait:.0f}s...")
                 _countdown(wait)
                 continue
             r.raise_for_status()
+            with _auth_403_lock:
+                _auth_403_streak = 0
             return r.json()
         except requests.HTTPError as e:
-            tqdm.write(f"  HTTP {r.status_code} on {url}: {e}")
+            status = _to_int(getattr(r, "status_code", 0), 0)
+            tqdm.write(f"  HTTP {status} on {url}: {e}")
+            if status in (401, 403):
+                if status == 401:
+                    _FATAL_AUTH_EVENT.set()
+                else:
+                    with _auth_403_lock:
+                        _auth_403_streak += 1
+                        if _auth_403_streak >= 3:
+                            _FATAL_AUTH_EVENT.set()
+                return {"success": False, "_fatal_auth": status, "_error": str(e)}
+            if 500 <= status < 600 and attempt < retries - 1:
+                wait_s = min(30, 5 * (attempt + 1))
+                time.sleep(wait_s)
+                continue
             return None
         except Exception as e:
             tqdm.write(f"  Error ({attempt+1}/{retries}): {e}")
@@ -230,23 +274,12 @@ def api_get(endpoint, params=None, retries=3, skip_on_ratelimit=False):
     return None
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-# CHECKPOINT  (鏂偣缁紶鐘舵€佹枃浠?
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+#
+# CHECKPOINT (?
+#
 
 class Checkpoint:
-    """
-    checkpoint.json 缁撴瀯:
-    {
-      "newest_post_created_at": "2026-02-26T01:29:21Z",
-      "newest_post_id": "uuid",
-      "total_posts": 1234,
-      "total_comments": 5678,
-      "runs": [...],
-      "_resume_cursor": "eyJ...",
-      "_resume_since": "2026-02-25T..."
-    }
-    """
+    """Persistent run metadata and cursor state stored in checkpoint.json."""
 
     def __init__(self, path: Path):
         self.path = path
@@ -278,8 +311,12 @@ class Checkpoint:
         return self.data.get("newest_post_created_at")
 
     def update_after_run(self, new_posts, new_comments, duration_s, newest_post=None,
-                         clear_cursor=True, reached_end=False):
-        if newest_post:
+                         clear_cursor=True, reached_end=False, advance_anchor=True):
+        # advance_anchor must only be True when the run actually closed the
+        # window down to the previous anchor (stopped_early/reached_end);
+        # otherwise the next incremental would start above unfetched posts
+        # and the gap would never be retried.
+        if newest_post and advance_anchor:
             current = self.data.get("newest_post_created_at")
             candidate = newest_post.get("created_at")
             if not current or (candidate and candidate > current):
@@ -310,8 +347,14 @@ class Checkpoint:
             current_oldest = self.data.get("oldest_post_created_at", "")
             if not current_oldest or bottom_date < current_oldest:
                 self.data["oldest_post_created_at"] = bottom_date
-        if newest_post and "_resume_newest_post" not in self.data:
-            self.data["_resume_newest_post"] = newest_post
+        if newest_post:
+            current = self.data.get("_resume_newest_post")
+            current_created = ""
+            if isinstance(current, dict):
+                current_created = current.get("created_at", "")
+            candidate_created = newest_post.get("created_at", "")
+            if not current_created or (candidate_created and candidate_created > current_created):
+                self.data["_resume_newest_post"] = newest_post
         self.save()
 
     def get_resume_cursor(self):
@@ -333,12 +376,12 @@ class Checkpoint:
         self.save()
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-# DATA FILES  (绱Н杩藉姞)
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+#
+# DATA FILES ()
+#
 
 class JsonlStore:
-    """杩藉姞鍐欏叆 .jsonl 鏂囦欢锛岀淮鎶や竴涓?ID set 鐢ㄤ簬鍘婚噸"""
+    """Append-only JSONL storage with in-memory dedup by id."""
 
     def __init__(self, path: Path, load_ids: bool = True):
         self.path = path
@@ -358,7 +401,7 @@ class JsonlStore:
         return ids
 
     def append_new(self, records):
-        """杩藉姞涓嶉噸澶嶇殑璁板綍锛岃繑鍥炲疄闄呭啓鍏ユ暟閲?"""
+        """Append non-duplicate records and return number written."""
         new = [r for r in records if r.get("id") not in self.seen_ids]
         if new:
             with open(self.path, "a", encoding="utf-8") as f:
@@ -372,13 +415,7 @@ class JsonlStore:
 
 
 class CommentsDoneCache:
-    """
-    杞婚噺缂撳瓨锛氳褰曞凡鎴愬姛鎶撳畬璇勮鐨?post_id锛堟瘡琛屼竴涓?UUID锛夈€?
-
-    - 鍚姩鍙渶璇诲嚑鍗?KB锛屽交搴曢伩鍏嶆瘡娆℃壂鎻?1.3 GB comments_all.jsonl銆?
-    - 棣栨杩愯鏃惰嚜鍔ㄤ粠 comments_all.jsonl 杩佺Щ锛堜竴娆℃€ф壂鎻忥紝涔嬪悗涓嶅啀闇€瑕侊級銆?
-    - mark_done() 鍦ㄨ瘎璁哄啓鐩樻垚鍔熷悗璋冪敤锛屼繚璇佸師瀛愭€э紙鍐欏け璐ヤ笉鏍囪锛夈€?
-    """
+    """Track posts whose comments are already fully fetched."""
 
     def __init__(self, path: Path, comments_jsonl: Path = None):
         self.path = path
@@ -396,9 +433,9 @@ class CommentsDoneCache:
                     self.done_ids.add(pid)
 
     def _migrate(self, jsonl: Path):
-        """涓€娆℃€т粠 comments_all.jsonl 鎵弿 post_id 瀛楁锛屽缓绔嬬紦瀛橈紙棣栨杩愯鏃舵墽琛岋級銆?"""
+        """Build done-cache from comments_all.jsonl once on first run."""
         size_mb = jsonl.stat().st_size / 1024 / 1024
-        print(f"  [鍒濆鍖朷 浠?comments_all.jsonl ({size_mb:.0f} MB) 寤虹珛杩涘害缂撳瓨锛堜粎姝や竴娆★級...",
+        print(f"  [init] building comments done-cache from comments_all.jsonl ({size_mb:.0f} MB), one-time...",
               end="", flush=True)
         with open(jsonl, encoding="utf-8") as f:
             for line in f:
@@ -414,10 +451,10 @@ class CommentsDoneCache:
         with open(self.path, "w", encoding="utf-8") as f:
             for pid in self.done_ids:
                 f.write(pid + "\n")
-        print(f" {len(self.done_ids):,} posts ✓")
+        print(f" {len(self.done_ids):,} posts done")
 
     def mark_done(self, post_id: str):
-        """鏍囪鏌愬笘璇勮宸插畬鎴愶紙杩藉姞鍐欏叆缂撳瓨鏂囦欢锛?"""
+        """Mark one post as done and append to cache file."""
         if post_id not in self.done_ids:
             self.done_ids.add(post_id)
             with open(self.path, "a", encoding="utf-8") as f:
@@ -430,22 +467,20 @@ class CommentsDoneCache:
         return len(self.done_ids)
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+#
 # FETCHERS
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+#
 
 class CommentsResumeCache:
-    """
-    璇勮鍒嗛〉鏂偣缂撳瓨锛坅ppend-only 鏃ュ織锛夛細
-    - key: post_id
-    - value: 涓嬩竴娆¤姹傝浣跨敤鐨?cursor锛圢one 琛ㄧず娓呴櫎鏂偣锛?
-    """
+    """Append-only cache for per-post comment resume cursors."""
 
     def __init__(self, path: Path):
         self.path = path
         self.cursors: dict = {}
+        self._line_count = 0
         if self.path.exists():
             self._load()
+            self.compact_if_needed()
 
     def _load(self):
         with open(self.path, encoding="utf-8") as f:
@@ -455,6 +490,7 @@ class CommentsResumeCache:
                     continue
                 try:
                     rec = json.loads(line)
+                    self._line_count += 1
                     pid = rec.get("post_id")
                     if not pid:
                         continue
@@ -481,24 +517,425 @@ class CommentsResumeCache:
         }
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        self._line_count += 1
+        self.compact_if_needed()
 
     def count(self) -> int:
         return len(self.cursors)
+
+    def compact_if_needed(self, force: bool = False):
+        target = max(10_000, len(self.cursors) * 8)
+        if not force and self._line_count <= target:
+            return
+        tmp = self.path.with_suffix(".compact_tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            for pid, cursor in self.cursors.items():
+                rec = {
+                    "post_id": pid,
+                    "cursor": cursor,
+                    "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        tmp.replace(self.path)
+        self._line_count = len(self.cursors)
+        tqdm.write(f"  [compact] resume cache compacted: {self._line_count:,} rows")
+
+
+class CommentsPostSyncState:
+    """Per-post sync state for cooldown/backoff scheduling."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.states: dict = {}
+        self._line_count = 0
+        if self.path.exists():
+            self._load()
+            self.compact_if_needed()
+
+    def _load(self):
+        with open(self.path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    self._line_count += 1
+                    pid = rec.get("post_id")
+                    if not pid:
+                        continue
+                    self.states[pid] = {
+                        "last_unique_count": _to_int(rec.get("last_unique_count"), 0),
+                        "no_gain_runs": _to_int(rec.get("no_gain_runs"), 0),
+                        "next_retry_at": _to_int(rec.get("next_retry_at"), 0),
+                        "last_error": str(rec.get("last_error", "") or ""),
+                        "updated_at": rec.get("updated_at", ""),
+                    }
+                except Exception:
+                    pass
+
+    def get(self, post_id: str) -> dict:
+        rec = self.states.get(post_id)
+        if not rec:
+            return {
+                "last_unique_count": 0,
+                "no_gain_runs": 0,
+                "next_retry_at": 0,
+                "last_error": "",
+                "updated_at": "",
+            }
+        return dict(rec)
+
+    def should_run(self, post_id: str, now_ts: int = None) -> bool:
+        now_ts = int(now_ts or time.time())
+        rec = self.states.get(post_id)
+        if not rec:
+            return True
+        return _to_int(rec.get("next_retry_at"), 0) <= now_ts
+
+    def _cooldown_seconds(self, no_gain_runs: int, expected: int) -> int:
+        if expected >= 20_000:
+            base = 6 * 3600
+        elif expected >= 5_000:
+            base = 3 * 3600
+        elif expected >= 500:
+            base = 3600
+        else:
+            base = 1800
+        exp = min(5, max(0, no_gain_runs - 1))
+        return int(min(7 * 24 * 3600, base * (2 ** exp)))
+
+    def _write_one(self, post_id: str, rec: dict):
+        payload = {
+            "post_id": post_id,
+            "last_unique_count": int(rec.get("last_unique_count", 0)),
+            "no_gain_runs": int(rec.get("no_gain_runs", 0)),
+            "next_retry_at": int(rec.get("next_retry_at", 0)),
+            "last_error": str(rec.get("last_error", "") or ""),
+            "updated_at": rec.get("updated_at") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self._line_count += 1
+
+    def update_after_fetch(self, post_id: str, expected: int, local_unique: int, unique_added: int,
+                           success: bool, resume_cursor: str, error: str = ""):
+        now_ts = int(time.time())
+        prev = self.get(post_id)
+        prev_unique = _to_int(prev.get("last_unique_count"), 0)
+        final_unique = max(prev_unique, _to_int(local_unique, 0) + max(0, _to_int(unique_added, 0)))
+        no_gain_runs = _to_int(prev.get("no_gain_runs"), 0)
+        last_error = ""
+        next_retry_at = 0
+
+        aligned = expected > 0 and final_unique >= expected
+        if aligned:
+            no_gain_runs = 0
+        elif success:
+            # End-of-thread underfill tends to be non-convergent; cool it down.
+            no_gain_runs = max(1, no_gain_runs + 1)
+            next_retry_at = now_ts + self._cooldown_seconds(no_gain_runs, expected)
+            last_error = "underfilled_at_thread_end"
+        elif resume_cursor:
+            if unique_added > 0:
+                no_gain_runs = 0
+            else:
+                no_gain_runs = no_gain_runs + 1
+                next_retry_at = now_ts + self._cooldown_seconds(no_gain_runs, expected)
+                last_error = error or "no_gain_with_resume"
+        else:
+            no_gain_runs = no_gain_runs + 1
+            next_retry_at = now_ts + self._cooldown_seconds(no_gain_runs, expected)
+            last_error = error or "fetch_failed"
+
+        rec = {
+            "last_unique_count": final_unique,
+            "no_gain_runs": no_gain_runs,
+            "next_retry_at": next_retry_at,
+            "last_error": last_error,
+            "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        self.states[post_id] = rec
+        self._write_one(post_id, rec)
+        self.compact_if_needed()
+
+    def force_retry(self, post_ids):
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        changed = 0
+        for pid in post_ids:
+            rec = self.get(pid)
+            rec["no_gain_runs"] = 0
+            rec["next_retry_at"] = 0
+            rec["last_error"] = "forced_refetch"
+            rec["updated_at"] = now_str
+            self.states[pid] = rec
+            self._write_one(pid, rec)
+            changed += 1
+        if changed:
+            self.compact_if_needed()
+        return changed
+
+    def compact_if_needed(self, force: bool = False):
+        target = max(20_000, len(self.states) * 8)
+        if not force and self._line_count <= target:
+            return
+        tmp = self.path.with_suffix(".compact_tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            for pid, rec in self.states.items():
+                payload = {"post_id": pid, **rec}
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        tmp.replace(self.path)
+        self._line_count = len(self.states)
+        tqdm.write(f"  [compact] post sync state compacted: {self._line_count:,} rows")
+
+
+class CommentsIdStore:
+    """Dedup store for (post_id, comment_id), in memory or sqlite."""
+
+    def __init__(self, mode: str = _DEFAULT_COMMENT_ID_CACHE_MODE, sqlite_path: Path = None):
+        m = (mode or _DEFAULT_COMMENT_ID_CACHE_MODE).strip().lower()
+        self.mode = m if m in ("memory", "sqlite") else _DEFAULT_COMMENT_ID_CACHE_MODE
+        self._memory = {}
+        self._conn = None
+        self._pending = 0
+        # add_if_new uses connection-level total_changes (sqlite) and
+        # check-then-add (memory); both race under workers > 1 without this.
+        self._add_lock = threading.Lock()
+        if self.mode == "sqlite":
+            if not sqlite_path:
+                raise ValueError("sqlite_path is required when comment id cache mode is sqlite")
+            sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(str(sqlite_path), check_same_thread=False, timeout=30.0)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA busy_timeout=30000")
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS comment_ids ("
+                "post_id TEXT NOT NULL, "
+                "comment_id TEXT NOT NULL, "
+                "PRIMARY KEY(post_id, comment_id)"
+                ")"
+            )
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_comment_ids_post ON comment_ids(post_id)")
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS comment_ids_meta ("
+                "k TEXT PRIMARY KEY, "
+                "v TEXT NOT NULL"
+                ")"
+            )
+            self._conn.commit()
+
+    def _meta_get(self, key: str, default: str = "") -> str:
+        if self.mode != "sqlite":
+            return default
+        row = self._conn.execute("SELECT v FROM comment_ids_meta WHERE k=?", (key,)).fetchone()
+        if not row:
+            return default
+        return str(row[0] if row[0] is not None else default)
+
+    def _meta_set(self, key: str, value):
+        if self.mode != "sqlite":
+            return
+        self._conn.execute(
+            "INSERT INTO comment_ids_meta(k, v) VALUES(?, ?) "
+            "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            (key, str(value)),
+        )
+
+    def _sqlite_sync_from_file(self, comments_path: Path):
+        if self.mode != "sqlite" or not comments_path.exists():
+            return
+        size = comments_path.stat().st_size
+        mtime = int(comments_path.stat().st_mtime)
+        saved_size = _to_int(self._meta_get("source_size", "0"), 0)
+        saved_mtime = _to_int(self._meta_get("source_mtime", "0"), 0)
+        saved_offset = _to_int(self._meta_get("indexed_offset", "0"), 0)
+        has_meta = bool(self._meta_get("indexed_offset", ""))
+
+        need_rebuild = (not has_meta) or (saved_offset > size) or (size < saved_size) or (mtime < saved_mtime)
+        start_offset = 0 if need_rebuild else saved_offset
+        if need_rebuild:
+            tqdm.write("  [id-store] sqlite index rebuild needed; rebuilding comment id index...")
+            self._conn.execute("DELETE FROM comment_ids")
+            self._conn.execute("DELETE FROM comment_ids_meta")
+            self._conn.commit()
+
+        scanned = 0
+        inserted = 0
+        batch = []
+        t0 = time.monotonic()
+        hb_last = t0
+
+        with open(comments_path, "rb") as fb:
+            if start_offset > 0:
+                fb.seek(start_offset)
+            while True:
+                line_b = fb.readline()
+                if not line_b:
+                    break
+                scanned += 1
+                try:
+                    line = line_b.decode("utf-8", errors="ignore").strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    pid = obj.get("post_id")
+                    cid = obj.get("id")
+                    if not pid or not cid:
+                        continue
+                    batch.append((str(pid), str(cid)))
+                    if len(batch) >= 4000:
+                        before = self._conn.total_changes
+                        self._conn.executemany(
+                            "INSERT OR IGNORE INTO comment_ids(post_id, comment_id) VALUES(?, ?)", batch
+                        )
+                        inserted += max(0, self._conn.total_changes - before)
+                        batch.clear()
+                except Exception:
+                    pass
+
+                now = time.monotonic()
+                if now - hb_last >= 15:
+                    speed = scanned / max(1e-6, (now - t0))
+                    tqdm.write(
+                        f"  [heartbeat id-store] mode=sqlite, indexed_lines={scanned:,}, "
+                        f"inserted={inserted:,}, speed~{speed:,.0f} lines/s"
+                    )
+                    hb_last = now
+
+            if batch:
+                before = self._conn.total_changes
+                self._conn.executemany("INSERT OR IGNORE INTO comment_ids(post_id, comment_id) VALUES(?, ?)", batch)
+                inserted += max(0, self._conn.total_changes - before)
+            end_offset = fb.tell()
+
+        self._meta_set("source_size", size)
+        self._meta_set("source_mtime", mtime)
+        self._meta_set("indexed_offset", end_offset)
+        self._meta_set("indexed_at", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        self._conn.commit()
+        tqdm.write(
+            f"  [id-store done] mode=sqlite, start_offset={start_offset:,}, end_offset={end_offset:,}, "
+            f"indexed_lines={scanned:,}, inserted={inserted:,}"
+        )
+
+    def seed_from_comments_file(self, comments_path: Path, target_ids: set):
+        if not comments_path.exists():
+            return
+        if self.mode == "sqlite":
+            self._sqlite_sync_from_file(comments_path)
+            return
+        if not target_ids:
+            return
+        scanned = 0
+        matched = 0
+        t0 = time.monotonic()
+        hb_last = t0
+        with open(comments_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                scanned += 1
+                try:
+                    obj = json.loads(line)
+                    pid = obj.get("post_id")
+                    if pid not in target_ids:
+                        continue
+                    cid = obj.get("id")
+                    if not cid:
+                        continue
+                    matched += 1
+                    if self.mode == "memory":
+                        bucket = self._memory.get(pid)
+                        if bucket is None:
+                            bucket = set()
+                            self._memory[pid] = bucket
+                        bucket.add(_id_fingerprint(cid))
+                except Exception:
+                    pass
+
+                now = time.monotonic()
+                if now - hb_last >= 15:
+                    speed = scanned / max(1e-6, (now - t0))
+                    tqdm.write(
+                        f"  [heartbeat id-store] mode={self.mode}, scanned={scanned:,}, matched={matched:,}, "
+                        f"posts={len(self._memory):,}, speed~{speed:,.0f} rows/s"
+                    )
+                    hb_last = now
+        tqdm.write(f"  [id-store done] mode={self.mode}, scanned={scanned:,}, matched={matched:,}")
+
+    def count_for_posts(self, post_ids):
+        out = {}
+        if not post_ids:
+            return out
+        ids = [str(pid) for pid in post_ids if pid]
+        if not ids:
+            return out
+
+        if self.mode == "memory":
+            for pid in ids:
+                out[pid] = len(self._memory.get(pid, set()))
+            return out
+
+        # Chunk IN (...) queries to stay under sqlite parameter limits.
+        out = {pid: 0 for pid in ids}
+        chunk = 800
+        for i in range(0, len(ids), chunk):
+            sub = ids[i:i + chunk]
+            qs = ",".join("?" for _ in sub)
+            rows = self._conn.execute(
+                f"SELECT post_id, COUNT(*) FROM comment_ids WHERE post_id IN ({qs}) GROUP BY post_id",
+                sub,
+            ).fetchall()
+            for row in rows:
+                pid = str(row[0])
+                out[pid] = _to_int(row[1], 0)
+        return out
+
+    def add_if_new(self, post_id: str, comment_id: str) -> bool:
+        if not comment_id:
+            return True
+        with self._add_lock:
+            if self.mode == "memory":
+                bucket = self._memory.get(post_id)
+                if bucket is None:
+                    bucket = set()
+                    self._memory[post_id] = bucket
+                fp = _id_fingerprint(comment_id)
+                if fp in bucket:
+                    return False
+                bucket.add(fp)
+                return True
+
+            before = self._conn.total_changes
+            self._conn.execute(
+                "INSERT OR IGNORE INTO comment_ids(post_id, comment_id) VALUES(?, ?)",
+                (post_id, str(comment_id)),
+            )
+            inserted = self._conn.total_changes > before
+            self._pending += 1
+            if self._pending >= 1000:
+                self._conn.commit()
+                self._pending = 0
+            return inserted
+
+    def close(self):
+        if self._conn is not None:
+            self._conn.commit()
+            self._conn.close()
+            self._conn = None
 
 
 def fetch_posts_incremental(checkpoint: Checkpoint, posts_store: "JsonlStore",
                             run_file, since_time=None, max_posts=None,
                             platform_total=0):
-    """
-    鎶撳笘瀛愶紝姣忛〉锛?00鏉★級绔嬪埢鍐欑洏锛屼笉鍦ㄥ唴瀛橀噷鍫嗙Н銆?
-    宕╀簡閲嶅惎浼氫粠涓婃鐨?cursor 缁х画锛屽凡鍐欏叆鐨勬暟鎹笉浼氫涪澶变篃涓嶄細閲嶅銆?
-
-    杩斿洖: (鏈鏂板啓鍏ユ潯鏁? 鏄惁鍥犵鍒版棫甯栧仠姝? 鏈€鏂板笘瀛?dict, api_error, reached_end)
-    """
+    """Fetch posts incrementally and stream writes to disk."""
     total_new = 0
     stopped_early = False
     api_error = False
     reached_end = False
+    keep_cursor = False  # True when stopping mid-window with a valid cursor on disk
     newest_post = None
     pages_seen = 0
     api_rows_seen = 0
@@ -509,16 +946,22 @@ def fetch_posts_incremental(checkpoint: Checkpoint, posts_store: "JsonlStore",
     last_page_sig = None
     same_page_sig_streak = 0
 
-    # 鏂偣缁紶锛氬鏋滀笂娆′腑閫斿穿浜嗭紝浠庝繚瀛樼殑 cursor 缁х画
+    # Resume from saved cursor — ONLY in full-history mode (since_time is None).
+    # In incremental mode a saved cursor points deep into a window; if the run
+    # that saved it was interrupted (common — the box gets shut/slept), posts
+    # that arrived at the TOP since then would be skipped because we'd continue
+    # paging older. So incremental always re-pages from the newest and relies on
+    # id-dedup + stop-at-known to handle the overlap cheaply.
     resume_cursor, resume_since, resume_newest = checkpoint.get_resume_cursor()
-    if resume_cursor and resume_since == since_time:
-        tqdm.write("  [鏂偣缁紶] 浠庝笂娆′腑鏂綅缃户缁?..")
+    if since_time is None and resume_cursor and resume_since == since_time:
+        tqdm.write("  [resume posts] continue from saved cursor (full mode)...")
         cursor = resume_cursor
         if resume_newest:
             newest_post = resume_newest
     else:
         cursor = None
         if resume_cursor:
+            tqdm.write("  [resume posts] incremental run: ignoring saved cursor, paging from newest.")
             checkpoint.clear_resume()
 
     pbar = tqdm(desc="fetch posts", unit="row", dynamic_ncols=True, total=pbar_total)
@@ -533,22 +976,35 @@ def fetch_posts_incremental(checkpoint: Checkpoint, posts_store: "JsonlStore",
             data = api_get("/posts", params)
 
             if not data or not data.get("success"):
-                api_error = True  # 淇濈暀 checkpoint cursor锛屼笅娆″彲鏂偣缁紶
+                auth_code = _to_int((data or {}).get("_fatal_auth"), 0) if isinstance(data, dict) else 0
+                if auth_code in (401, 403):
+                    api_error = True
+                    tqdm.write(f"  [fatal] posts auth error {auth_code}; stop posts stage and keep cursor.")
+                    break
+
+                api_error = True  # keep checkpoint cursor for next run
                 retry_delay = 120
                 retry_n = 0
-                while True:
+                while retry_n < _DEFAULT_POST_MAX_RECOVER_RETRIES:
                     retry_n += 1
                     tqdm.write(
-                        f"  [!] 鏈嶅姟鍣ㄩ敊璇紙绗?{retry_n} 娆￠噸璇曪級锛?"
-                        f"{retry_delay // 60} 鍒嗛挓鍚庤嚜鍔ㄩ噸璇?.. 鎸?Ctrl+C 鍙仠姝?"
+                        f"  [!] server error (retry #{retry_n}); "
+                        f"auto retry in {retry_delay // 60} min... press Ctrl+C to stop."
                     )
                     time.sleep(retry_delay)
                     data = api_get("/posts", params)
+                    auth_code = _to_int((data or {}).get("_fatal_auth"), 0) if isinstance(data, dict) else 0
+                    if auth_code in (401, 403):
+                        tqdm.write(f"  [fatal] posts auth error {auth_code}; stop posts stage and keep cursor.")
+                        break
                     if data and data.get("success"):
                         api_error = False
                         tqdm.write("  [+] retry success, continue.")
                         break
                     retry_delay = min(retry_delay * 2, 600)
+                if not data or not data.get("success"):
+                    tqdm.write("  [!] posts stage stopped after max recover retries; will continue next run from cursor.")
+                    break
 
             batch = data.get("posts", [])
             if not batch:
@@ -569,8 +1025,12 @@ def fetch_posts_incremental(checkpoint: Checkpoint, posts_store: "JsonlStore",
             pages_seen += 1
             api_rows_seen += len(batch)
 
-            if newest_post is None and batch:
-                newest_post = batch[0]
+            if batch:
+                page_newest = batch[0]
+                page_created = page_newest.get("created_at", "")
+                current_created = newest_post.get("created_at", "") if isinstance(newest_post, dict) else ""
+                if newest_post is None or (page_created and page_created > current_created):
+                    newest_post = page_newest
 
             if since_time:
                 new_batch = [p for p in batch if p.get("created_at", "") > since_time]
@@ -599,11 +1059,20 @@ def fetch_posts_incremental(checkpoint: Checkpoint, posts_store: "JsonlStore",
                                 f"  [info] zero-write streak={zero_write_streak} pages (incremental overlap or cursor loop)."
                             )
                         else:
-                            tqdm.write("  [info] 杩炵画 25 椤垫棤鏂板锛屽綋鍓嶅湪宸叉姄閲嶅彔鍖猴紝缁х画鍚戞洿鏃╁巻鍙叉帹杩?..")
+                            tqdm.write(
+                                "  [info] 25 pages in a row with no new rows; likely overlap area, keep scanning older history."
+                            )
+                    if since_time and zero_write_streak >= _DEFAULT_POST_ZERO_STREAK_GUARD:
+                        tqdm.write(
+                            f"  [guard] zero-write streak reached {_DEFAULT_POST_ZERO_STREAK_GUARD} pages in incremental mode; "
+                            "stop this posts pass to avoid empty replay (cursor kept; next run continues here)."
+                        )
+                        keep_cursor = True
+                        break
                 else:
                     zero_write_streak = 0
                 pbar.set_postfix_str(
-                    f"鏈〉+{written}/{len(batch)} | 绱+{total_new} | 杩炵画0椤?{zero_write_streak} | 褰撳墠:{cur_date}"
+                    f"page+{written}/{len(batch)} | total+{total_new} | zero_pages:{zero_write_streak} | date:{cur_date}"
                 )
 
             now_hb = time.monotonic()
@@ -618,6 +1087,10 @@ def fetch_posts_incremental(checkpoint: Checkpoint, posts_store: "JsonlStore",
                 break
 
             if max_posts and total_new >= max_posts:
+                # Truncation, not completion: keep the per-page cursor so the
+                # next run resumes inside the window instead of re-paging from
+                # the top (where the zero-streak guard could fire first).
+                keep_cursor = True
                 break
 
             next_cursor = data.get("next_cursor")
@@ -637,17 +1110,23 @@ def fetch_posts_incremental(checkpoint: Checkpoint, posts_store: "JsonlStore",
         pbar.close()
         tqdm.write(f"  [posts] pages={pages_seen}, api_rows={api_rows_seen}, new_rows={total_new}")
 
-    return total_new, stopped_early, newest_post, api_error, reached_end
+    return total_new, stopped_early, newest_post, api_error, reached_end, keep_cursor
 
 
-def _fetch_one_post_comments(post, start_cursor=None, page_progress_cb=None):
+def _fetch_one_post_comments(post, start_cursor=None, page_progress_cb=None, page_write_cb=None):
     """
     Fetch comments for one post using cursor pagination.
-    Returns: (post, flat_comments, success, resume_cursor)
+    Stream page results via page_write_cb when provided.
+    Returns: (post, success, resume_cursor, raw_rows, written_rows, written_unique)
     """
-    all_flat = []
+    if _FATAL_AUTH_EVENT.is_set():
+        # Auth is dead platform-wide; don't waste a request per queued post.
+        return post, False, start_cursor, 0, 0, 0
     cursor = start_cursor
     page = 0
+    raw_rows_total = 0
+    written_rows_total = 0
+    written_unique_total = 0
     hb_last = time.monotonic()
     if start_cursor:
         tqdm.write(f"  [resume post] {post['id'][:8]}... continue from saved cursor")
@@ -661,32 +1140,51 @@ def _fetch_one_post_comments(post, start_cursor=None, page_progress_cb=None):
             data = api_get(f"/posts/{post['id']}/comments", params=params)
             if data and data.get("success"):
                 break
+            if isinstance(data, dict) and data.get("_fatal_auth"):
+                # 401/403 is not transient — abort this post (and, via the
+                # event, the whole stage) instead of retrying.
+                return post, False, cursor, raw_rows_total, written_rows_total, written_unique_total
             if data is None:
                 # Keep partial pages and current cursor for next run.
-                return post, all_flat, False, cursor
+                return post, False, cursor, raw_rows_total, written_rows_total, written_unique_total
             if attempt < 2:
                 tqdm.write(f"  [!] {post['id'][:8]}... p{page} server error, retry ({attempt+1}/2)...")
                 time.sleep(10)
         else:
-            return post, all_flat, False, cursor
+            return post, False, cursor, raw_rows_total, written_rows_total, written_unique_total
 
         flat = _flatten_comments(data.get("comments", []))
         for c in flat:
             c["post_id"] = post["id"]
             c["post_title"] = post.get("title", "")
             c["submolt"] = post.get("submolt", {}).get("name", "")
-        all_flat.extend(flat)
+        raw_rows_total += len(flat)
+        if page_write_cb:
+            try:
+                wr_rows, wr_unique = page_write_cb(post, flat, page + 1)
+                written_rows_total += max(0, _to_int(wr_rows, 0))
+                written_unique_total += max(0, _to_int(wr_unique, 0))
+                page_written_rows = max(0, _to_int(wr_rows, 0))
+            except Exception:
+                page_written_rows = 0
+                pass
+        else:
+            written_rows_total += len(flat)
+            written_unique_total += len(flat)
+            page_written_rows = len(flat)
         page += 1
         if page_progress_cb:
             try:
-                page_progress_cb(post["id"], page, len(flat), len(all_flat))
+                page_progress_cb(
+                    post["id"], page, len(flat), page_written_rows, raw_rows_total, written_rows_total, written_unique_total
+                )
             except Exception:
                 pass
 
         now_hb = time.monotonic()
         if page % 20 == 0 or (now_hb - hb_last >= 20):
             tqdm.write(
-                f"  [heartbeat comments] {post['id'][:8]}... pages={page}, rows~{len(all_flat)}"
+                f"  [heartbeat comments] {post['id'][:8]}... pages={page}, raw~{raw_rows_total}, written~{written_rows_total}"
             )
             hb_last = now_hb
 
@@ -694,18 +1192,68 @@ def _fetch_one_post_comments(post, start_cursor=None, page_progress_cb=None):
             break
         cursor = data["next_cursor"]
 
-    return post, all_flat, True, None
+    return post, True, None, raw_rows_total, written_rows_total, written_unique_total
 
 
-def _count_comments_for_target_posts(comments_path: Path, target_ids: set):
+def _count_comments_for_target_posts(comments_path: Path, target_ids: set, strict_unique: bool = True):
     """
-    Count existing comment rows for a target post_id set.
+    Count existing local comments for target post_id set.
+    strict_unique=True deduplicates by (post_id, comment_id).
     Also prints heartbeat logs while scanning large comments files.
     """
     counts = Counter()
     if not target_ids or not comments_path.exists():
         return counts
 
+    scanned = 0
+    matched = 0
+    deduped = 0
+    seen_pairs = set() if strict_unique else None
+    t0 = time.monotonic()
+    hb_last = t0
+    with open(comments_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            scanned += 1
+            try:
+                obj = json.loads(line)
+                pid = obj.get("post_id")
+                if pid in target_ids:
+                    cid = obj.get("id")
+                    if strict_unique and cid:
+                        fp = _pair_fingerprint(pid, cid)
+                        if fp in seen_pairs:
+                            deduped += 1
+                            continue
+                        seen_pairs.add(fp)
+                    counts[pid] += 1
+                    matched += 1
+            except Exception:
+                pass
+
+            now = time.monotonic()
+            if now - hb_last >= 15:
+                speed = scanned / max(1e-6, (now - t0))
+                tqdm.write(
+                    f"  [heartbeat count] scanned_comments={scanned:,}, matched={matched:,}, deduped={deduped:,}, speed~{speed:,.0f} rows/s"
+                )
+                hb_last = now
+
+    mode = "unique" if strict_unique else "rows"
+    tqdm.write(
+        f"  [count done] mode={mode}, scanned_comments={scanned:,}, matched={matched:,}, "
+        f"deduped={deduped:,}, target_posts={len(target_ids):,}"
+    )
+    return counts
+
+
+def _build_comment_id_index_for_posts(comments_path: Path, target_ids: set):
+    """Build per-post comment-id fingerprint sets for dedup before append."""
+    idx = {}
+    if not target_ids or not comments_path.exists():
+        return idx
     scanned = 0
     matched = 0
     t0 = time.monotonic()
@@ -717,35 +1265,138 @@ def _count_comments_for_target_posts(comments_path: Path, target_ids: set):
                 continue
             scanned += 1
             try:
-                pid = json.loads(line).get("post_id")
-                if pid in target_ids:
-                    counts[pid] += 1
-                    matched += 1
+                obj = json.loads(line)
+                pid = obj.get("post_id")
+                if pid not in target_ids:
+                    continue
+                cid = obj.get("id")
+                if not cid:
+                    continue
+                bucket = idx.get(pid)
+                if bucket is None:
+                    bucket = set()
+                    idx[pid] = bucket
+                bucket.add(_id_fingerprint(cid))
+                matched += 1
             except Exception:
                 pass
-
             now = time.monotonic()
             if now - hb_last >= 15:
                 speed = scanned / max(1e-6, (now - t0))
                 tqdm.write(
-                    f"  [heartbeat count] scanned_comments={scanned:,}, matched={matched:,}, speed~{speed:,.0f} rows/s"
+                    f"  [heartbeat id-index] scanned={scanned:,}, matched={matched:,}, posts={len(idx):,}, speed~{speed:,.0f} rows/s"
                 )
                 hb_last = now
+    tqdm.write(f"  [id-index done] scanned={scanned:,}, matched={matched:,}, indexed_posts={len(idx):,}")
+    return idx
 
-    tqdm.write(f"  [count done] scanned_comments={scanned:,}, matched={matched:,}, target_posts={len(target_ids):,}")
-    return counts
+
+def _estimate_remaining_comments(post: dict) -> int:
+    """Estimate remaining work for one post in queue scheduling."""
+    gap = _to_int(post.get("gap"), 0)
+    if gap > 0:
+        return gap
+    expected = max(0, _to_int(post.get("comment_count"), 0))
+    local = max(0, _to_int(post.get("local_count"), 0))
+    remaining = expected - local
+    if remaining > 0:
+        return remaining
+    if post.get("is_resume"):
+        # Resume jobs still have unfinished cursor pages even when numeric gap looks 0.
+        return max(1, expected)
+    return 0
+
+
+def _sort_comment_layer(posts: list, *, large_first: bool):
+    if large_first:
+        posts.sort(
+            key=lambda p: (
+                0 if p.get("is_resume") else 1,
+                -p.get("_remaining_est", 0),
+                -_to_int(p.get("comment_count"), 0),
+            )
+        )
+        return
+    posts.sort(
+        key=lambda p: (
+            0 if p.get("is_resume") else 1,
+            p.get("_remaining_est", 0),
+            _to_int(p.get("comment_count"), 0),
+        )
+    )
+
+
+def _schedule_comment_queue(posts: list, strategy: str, small_max: int, medium_max: int):
+    """
+    Build final comment queue order.
+    - layered: small -> medium -> long
+    - small-first: global ascending by remaining
+    - large-first: legacy behavior, global descending by remaining
+    Returns: (ordered_posts, layer_stats[(label, count, remaining_sum, resume_count)])
+    """
+    queue = list(posts)
+    for p in queue:
+        p["_remaining_est"] = max(0, _estimate_remaining_comments(p))
+
+    def _stat(label: str, layer: list):
+        return (
+            label,
+            len(layer),
+            sum(_to_int(x.get("_remaining_est"), 0) for x in layer),
+            sum(1 for x in layer if x.get("is_resume")),
+        )
+
+    if strategy == "small-first":
+        _sort_comment_layer(queue, large_first=False)
+        return queue, [_stat("all", queue)]
+
+    if strategy == "large-first":
+        _sort_comment_layer(queue, large_first=True)
+        return queue, [_stat("all", queue)]
+
+    # layered (default): converge quick wins first, then chew long threads
+    small_layer = []
+    medium_layer = []
+    long_layer = []
+    for p in queue:
+        rem = p.get("_remaining_est", 0)
+        if rem <= small_max:
+            small_layer.append(p)
+        elif rem <= medium_max:
+            medium_layer.append(p)
+        else:
+            long_layer.append(p)
+
+    _sort_comment_layer(small_layer, large_first=False)
+    _sort_comment_layer(medium_layer, large_first=False)
+    _sort_comment_layer(long_layer, large_first=False)
+
+    ordered = small_layer + medium_layer + long_layer
+    stats = [
+        _stat(f"small<={small_max}", small_layer),
+        _stat(f"medium<={medium_max}", medium_layer),
+        _stat(f"long>{medium_max}", long_layer),
+    ]
+    return ordered, stats
 
 
 def fetch_comments_for_posts(posts_store: "JsonlStore", comments_path: Path,
                              done_cache: "CommentsDoneCache",
                              run_file, workers=5, min_comments=1, max_posts=0,
-                             resume_cache: "CommentsResumeCache" = None):
+                             resume_cache: "CommentsResumeCache" = None,
+                             sync_state: "CommentsPostSyncState" = None,
+                             comment_id_cache_mode: str = _DEFAULT_COMMENT_ID_CACHE_MODE,
+                             comment_id_cache_path: Path = None,
+                             queue_strategy: str = _DEFAULT_COMMENT_QUEUE_STRATEGY,
+                             queue_small_max: int = _DEFAULT_QUEUE_SMALL_MAX,
+                             queue_medium_max: int = _DEFAULT_QUEUE_MEDIUM_MAX):
     """
     Concurrently fetch comments with gap-based backfill.
     Strategy:
     1) Build eligible post set (comment_count >= min_comments)
     2) Count local comment rows for those posts
     3) Backfill only posts where local_count != comment_count, plus resume-cursor posts
+    4) Schedule queue by strategy (default layered: small -> medium -> long)
     Returns: (new_comment_rows_written, total_eligible_posts)
     """
     if not posts_store.path.exists():
@@ -788,17 +1439,39 @@ def fetch_comments_for_posts(posts_store: "JsonlStore", comments_path: Path,
         print(f"\r  eligible=0 (scanned {scanned:,})")
         return 0, total_eligible
 
-    # 2) count local comments for eligible posts
+    # 2) count local comments for eligible posts (prefer unique comment_id accounting)
     expected_by_id = {p["id"]: int(p.get("comment_count", 0) or 0) for p in eligible_posts}
     eligible_ids = set(expected_by_id.keys())
-    local_counts = _count_comments_for_target_posts(comments_path, eligible_ids)
+    id_store = None
+    strict_unique = True
+    if comment_id_cache_mode == "sqlite":
+        id_store = CommentsIdStore(mode=comment_id_cache_mode, sqlite_path=comment_id_cache_path)
+        id_store.seed_from_comments_file(comments_path, eligible_ids)
+        local_counts = Counter(id_store.count_for_posts(eligible_ids))
+        tqdm.write(
+            f"  [count done] mode=unique(sqlite), counted_posts={len(local_counts):,}, "
+            f"target_posts={len(eligible_ids):,}"
+        )
+    else:
+        if len(eligible_ids) > 120_000:
+            # Row-based counting treats duplicate rows as coverage: posts with
+            # legacy dup rows look "complete" and get silently skipped forever.
+            raise SystemExit(
+                f"  [fatal] {len(eligible_ids):,} eligible posts is too many for the in-memory "
+                "id cache; row-based fallback would silently skip posts that contain duplicate "
+                "rows. Re-run with --comment-id-cache sqlite."
+            )
+        local_counts = _count_comments_for_target_posts(comments_path, eligible_ids, strict_unique=True)
 
     # 3) build mismatch queue (and preserve resume-cursor posts)
     resume_ids = set(resume_cache.cursors.keys()) if resume_cache else set()
     posts_needing_comments = []
+    cooled_candidates = []
+    cooled_skipped = 0
     matched_exact = 0
     local_gt_expected = 0
     total_gap = 0
+    now_ts = int(time.time())
     for p in eligible_posts:
         pid = p["id"]
         exp = expected_by_id[pid]
@@ -816,12 +1489,32 @@ def fetch_comments_for_posts(posts_store: "JsonlStore", comments_path: Path,
         post_rec["local_count"] = got
         post_rec["gap"] = gap
         post_rec["is_resume"] = is_resume
+        if sync_state and not is_resume:
+            st = sync_state.get(pid)
+            post_rec["no_gain_runs"] = _to_int(st.get("no_gain_runs"), 0)
+            post_rec["next_retry_at"] = _to_int(st.get("next_retry_at"), 0)
+            if post_rec["next_retry_at"] > now_ts:
+                cooled_skipped += 1
+                cooled_candidates.append(post_rec)
+                continue
         posts_needing_comments.append(post_rec)
+
+    # Probe a tiny sample of cooled posts each run to avoid permanent starvation.
+    if cooled_candidates:
+        probe_n = min(5, max(1, len(cooled_candidates) // 200))
+        cooled_candidates.sort(key=lambda x: x.get("next_retry_at", 0))
+        probes = cooled_candidates[:probe_n]
+        for p in probes:
+            p["is_probe"] = True
+            posts_needing_comments.append(p)
 
     print(
         f"\r  eligible={total_eligible:,} | exact={matched_exact:,} | local>expected={local_gt_expected:,} "
         f"| pending={len(posts_needing_comments):,} | total_gap~{total_gap:,}"
     )
+    if cooled_skipped:
+        print(f"  [cooldown] skipped {cooled_skipped:,} posts by sync-state cooldown")
+        print(f"  [cooldown] probe retry this run: {min(5, max(1, len(cooled_candidates) // 200)):,} posts")
 
     if resume_cache and resume_cache.count():
         print(f"  [resume] {resume_cache.count():,} posts have saved cursors")
@@ -837,24 +1530,43 @@ def fetch_comments_for_posts(posts_store: "JsonlStore", comments_path: Path,
 
     if not posts_needing_comments:
         print("  [ok] all eligible posts are already aligned with local comment rows")
+        if id_store:
+            id_store.close()
         return 0, total_eligible
 
-    # prioritize resume posts first, then bigger gap, then bigger threads
-    posts_needing_comments.sort(
-        key=lambda p: (0 if p.get("is_resume") else 1, -max(0, p.get("gap", 0)), -p.get("comment_count", 0))
+    posts_needing_comments, layer_stats = _schedule_comment_queue(
+        posts_needing_comments,
+        strategy=queue_strategy,
+        small_max=queue_small_max,
+        medium_max=queue_medium_max,
     )
+    if layer_stats:
+        bits = []
+        for label, count, rem_sum, resume_n in layer_stats:
+            if count <= 0:
+                continue
+            bits.append(f"{label}: {count:,} posts (remaining~{rem_sum:,}, resume={resume_n:,})")
+        if bits:
+            print(f"  [queue] strategy={queue_strategy} | " + " | ".join(bits))
+
     if max_posts and len(posts_needing_comments) > max_posts:
         posts_needing_comments = posts_needing_comments[:max_posts]
         print(f"  [limit] this run will fetch top {max_posts:,} posts")
+
+    queue_ids = {p["id"] for p in posts_needing_comments}
+    if id_store is None:
+        id_store = CommentsIdStore(mode=comment_id_cache_mode, sqlite_path=comment_id_cache_path)
+        id_store.seed_from_comments_file(comments_path, queue_ids)
 
     rate = 60 / _rate_limiter_comments._interval
     eta_min = len(posts_needing_comments) / rate
     print(f"  ETA {eta_min/60:.1f} hours ({rate:.0f} req/min, {workers} workers)")
 
-    total_new = 0
+    total_new_rows = 0
+    total_new_unique = 0
     posts_done = 0
     write_lock = threading.Lock()
-    per_post_written_est = Counter(local_counts)
+    per_post_unique_est = Counter(local_counts)
     per_post_remaining = {
         p["id"]: max(0, int(p.get("comment_count", 0)) - int(p.get("local_count", 0)))
         for p in posts_needing_comments
@@ -865,90 +1577,131 @@ def fetch_comments_for_posts(posts_store: "JsonlStore", comments_path: Path,
                 unit="post", dynamic_ncols=True, position=0)
     pages_bar = tqdm(total=None, desc="comment pages", unit="page",
                      dynamic_ncols=True, position=1, leave=False)
-    pages_bar.set_postfix_str("rows~0")
+    pages_bar.set_postfix_str("raw~0 | written~0")
 
     pages_seen = 0
-    rows_seen = 0
+    rows_seen_raw = 0
+    rows_seen_written = 0
     progress_lock = threading.Lock()
 
-    def on_page_progress(post_id, page_no, page_rows, post_rows_total):
-        nonlocal pages_seen, rows_seen
+    comments_f = open(comments_path, "a", encoding="utf-8")
+
+    def on_page_progress(post_id, page_no, page_rows, page_written_rows, post_rows_total, post_written_total, post_unique_total):
+        nonlocal pages_seen, rows_seen_raw, rows_seen_written
         with progress_lock:
             pages_seen += 1
-            rows_seen += max(0, int(page_rows))
+            rows_seen_raw += max(0, int(page_rows))
+            rows_seen_written += max(0, int(page_written_rows))
             pages_bar.update(1)
             if workers == 1:
                 pages_bar.set_description_str(f"reading {post_id[:8]}...")
                 pages_bar.set_postfix_str(
-                    f"post_p={page_no} | post_rows~{post_rows_total:,} | total_rows~{rows_seen:,}"
+                    f"post_p={page_no} | post_raw~{post_rows_total:,} | post_written~{post_written_total:,} | total_written~{rows_seen_written:,}"
                 )
             else:
                 pages_bar.set_postfix_str(
-                    f"last={post_id[:8]} p={page_no} | total_rows~{rows_seen:,}"
+                    f"last={post_id[:8]} p={page_no} | total_written~{rows_seen_written:,}"
                 )
+
+    def on_page_write(post, flat, page_no):
+        nonlocal total_new_rows, total_new_unique
+        pid = post["id"]
+        to_write = []
+        unique_added = 0
+        for c in flat:
+            cid = c.get("id")
+            if cid:
+                if not id_store.add_if_new(pid, str(cid)):
+                    continue
+                unique_added += 1
+            else:
+                unique_added += 1
+            to_write.append(c)
+
+        if not to_write:
+            return 0, 0
+
+        payload = "".join(json.dumps(c, ensure_ascii=False) + "\n" for c in to_write)
+        with write_lock:
+            comments_f.write(payload)
+            run_file.write(payload)
+            comments_f.flush()
+            run_file.flush()
+            total_new_rows += len(to_write)
+            total_new_unique += unique_added
+        return len(to_write), unique_added
 
     try:
         chunk_size = workers * 20
         with ThreadPoolExecutor(max_workers=workers) as executor:
             for i in range(0, len(posts_needing_comments), chunk_size):
+                if _FATAL_AUTH_EVENT.is_set():
+                    tqdm.write("  [fatal] 401/403 auth failure; aborting comments stage (cursors kept for resume).")
+                    break
                 chunk = posts_needing_comments[i:i + chunk_size]
                 futures = {}
                 for post in chunk:
                     start_cursor = resume_cache.get(post["id"]) if resume_cache else None
-                    futures[executor.submit(_fetch_one_post_comments, post, start_cursor, on_page_progress)] = post
+                    futures[executor.submit(
+                        _fetch_one_post_comments, post, start_cursor, on_page_progress, on_page_write
+                    )] = post
 
                 for future in as_completed(futures):
-                    post, flat, success, resume_cursor = future.result()
+                    post, success, resume_cursor, raw_rows, written_rows, written_unique = future.result()
                     pid = post["id"]
-                    written_now = len(flat)
-
-                    if flat:
-                        with write_lock:
-                            # Partial-save mode may create rare duplicates across retries.
-                            with open(comments_path, "a", encoding="utf-8") as cf:
-                                for c in flat:
-                                    cf.write(json.dumps(c, ensure_ascii=False) + "\n")
-                            for c in flat:
-                                run_file.write(json.dumps(c, ensure_ascii=False) + "\n")
-                            run_file.flush()
-                            total_new += written_now
-
-                    if written_now:
-                        per_post_written_est[pid] += written_now
-                        consumed = min(per_post_remaining.get(pid, 0), written_now)
+                    if written_unique:
+                        per_post_unique_est[pid] += written_unique
+                        consumed = min(per_post_remaining.get(pid, 0), written_unique)
                         per_post_remaining[pid] = max(0, per_post_remaining.get(pid, 0) - consumed)
                         gap_remaining = max(0, gap_remaining - consumed)
 
                     if success:
                         if resume_cache:
                             resume_cache.set(pid, None)
-                        # Backward-compatible cache update: only mark "done" when local rows reach expected.
-                        if per_post_written_est.get(pid, 0) >= expected_by_id.get(pid, 0):
+                        if per_post_unique_est.get(pid, 0) >= expected_by_id.get(pid, 0):
                             done_cache.mark_done(pid)
                     elif resume_cache and resume_cursor:
                         resume_cache.set(pid, resume_cursor)
                         exp = expected_by_id.get(pid, 0)
-                        got = per_post_written_est.get(pid, 0)
+                        got = per_post_unique_est.get(pid, 0)
                         if exp > 0:
                             rem = max(0, exp - got)
                             tqdm.write(f"  [partial] {pid[:8]}... saved~{got}/{exp}, remaining~{rem}, cursor saved")
                         else:
                             tqdm.write(f"  [partial] {pid[:8]}... saved~{got}, cursor saved")
 
+                    if sync_state:
+                        err = "" if success else "partial_or_failed"
+                        sync_state.update_after_fetch(
+                            pid,
+                            expected=expected_by_id.get(pid, 0),
+                            local_unique=local_counts.get(pid, 0),
+                            unique_added=written_unique,
+                            success=bool(success),
+                            resume_cursor=resume_cursor or "",
+                            error=err,
+                        )
+
                     posts_done += 1
                     pbar.update(1)
                     resume_n = resume_cache.count() if resume_cache else 0
                     pbar.set_postfix_str(
-                        f"new rows {total_new} | gap~{gap_remaining} | done {posts_done}/{len(posts_needing_comments)} | resume {resume_n}"
+                        f"new rows {total_new_rows} | unique+{total_new_unique} | gap~{gap_remaining} | "
+                        f"done {posts_done}/{len(posts_needing_comments)} | resume {resume_n}"
                     )
     finally:
         pbar.close()
         pages_bar.close()
+        comments_f.close()
+        id_store.close()
 
     resume_left = resume_cache.count() if resume_cache else 0
-    print(f"  comment pages fetched: {pages_seen:,} | observed rows: {rows_seen:,}")
-    print(f"  comments newly written: {total_new:,} | processed posts: {posts_done:,} | resume left: {resume_left:,}")
-    return total_new, total_eligible
+    print(f"  comment pages fetched: {pages_seen:,} | raw rows seen: {rows_seen_raw:,} | written rows: {rows_seen_written:,}")
+    print(
+        f"  comments newly written: rows={total_new_rows:,}, unique_est={total_new_unique:,}  |  "
+        f"processed posts: {posts_done:,}  |  resume left: {resume_left:,}"
+    )
+    return total_new_rows, total_eligible
 
 
 def _flatten_comments(comments, depth=0):
@@ -970,15 +1723,69 @@ def fetch_submolts():
 
 
 def fetch_platform_stats():
-    """浠?/stats 鑾峰彇骞冲彴鐪熷疄鎬婚噺銆傞檺閫熸椂璺宠繃涓嶉樆濉炪€?"""
+    """Fetch /stats and return {} when unavailable or rate limited."""
     data = api_get("/stats", skip_on_ratelimit=True)
     if not data:
         return {}
     return data
 
 
+#
+# AGENT SNAPSHOTS (time series)
+#
+
+def take_agent_snapshot(out: Path):
+    """
+    Save a point-in-time snapshot of every agent's key metrics.
+    Reads agents_seen.jsonl and writes a compact JSONL file to
+    data/agent_snapshots/YYYYMMDD_HHMMSS.jsonl with one row per agent
+    containing only the fields needed for longitudinal analysis.
+    """
+    agents_path = out / "agents_seen.jsonl"
+    if not agents_path.exists():
+        print("  [agent-snapshot] agents_seen.jsonl not found; skip.")
+        return None
+
+    snap_dir = out / "agent_snapshots"
+    snap_dir.mkdir(exist_ok=True)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    snap_path = snap_dir / f"{ts}.jsonl"
+    sampled_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    count = 0
+    with open(agents_path, encoding="utf-8") as fin, \
+         open(snap_path, "w", encoding="utf-8") as fout:
+        for line in fin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                a = json.loads(line)
+                record = {
+                    "id":             a.get("id", ""),
+                    "name":           a.get("name", ""),
+                    "karma":          a.get("karma", 0),
+                    "followerCount":  a.get("followerCount", 0),
+                    "followingCount": a.get("followingCount", 0),
+                    "isClaimed":      a.get("isClaimed", False),
+                    "isActive":       a.get("isActive", False),
+                    "createdAt":      a.get("createdAt", ""),
+                    "lastActive":     a.get("lastActive", ""),
+                    "sampled_at":     sampled_at,
+                }
+                fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                count += 1
+            except Exception:
+                pass
+
+    size_kb = snap_path.stat().st_size / 1024
+    print(f"  [agent-snapshot] {count:,} agents -> {snap_path.name} ({size_kb:.0f} KB)")
+    return snap_path
+
+
 def _snap_record(p: dict, sampled_at: str, sort_source: str) -> dict:
-    """浠庡笘瀛愬璞℃彁鍙栧揩鐓у瓧娈点€?"""
+    """Extract one snapshot record from a post object."""
     return {
         "post_id":       p.get("id", ""),
         "sampled_at":    sampled_at,
@@ -995,20 +1802,15 @@ def _snap_record(p: dict, sampled_at: str, sort_source: str) -> dict:
     }
 
 
-# 姣忔蹇収鎶撳彇鐨勬帓搴?脳 椤垫暟閰嶇疆锛?
-#   hot    3椤?=  ~300 鏉? 褰撳墠鐑棬锛堣繎鏈熺梾姣掑紡浼犳挱锛?
-#   rising 2椤?=  ~200 鏉? 涓婂崌涓紙鏂板叴甯栧瓙锛?
-#   top   20椤?= ~2000 鏉? 鍘嗗彶楂樺垎锛堢ǔ瀹氳拷韪叏骞冲彴鏈€浣冲笘锛?
+# ? ?
+# hot 3?= ~300 ? ?
+# rising 2?= ~200 ? ?
+# top 20?= ~2000 ? ?
 _SNAPSHOT_SORTS = [("hot", 3), ("rising", 2), ("top", 20)]
 
 
 def fetch_hot_snapshot(out: Path, sorts_config=None):
-    """
-    鎶?hot/rising/top 鎺掕姒滃綋鍓嶇姸鎬侊紝杩藉姞鍐欏叆 data/post_snapshots.jsonl銆?
-
-    榛樿鎶?~2500 鏉★紙hot脳3椤?+ rising脳2椤?+ top脳20椤碉級锛岀害 25 涓?API 璇锋眰銆?
-    澶氭杩愯鍚庡彲鎸?post_id 鑱氬悎鍑烘椂搴忔洸绾匡紝鐢ㄤ簬鐮旂┒甯栧瓙璧扮孩杩囩▼銆?
-    """
+    """Fetch hot/rising/top snapshots into post_snapshots.jsonl."""
     if sorts_config is None:
         sorts_config = _SNAPSHOT_SORTS
     snapshots_path = out / "post_snapshots.jsonl"
@@ -1038,27 +1840,19 @@ def fetch_hot_snapshot(out: Path, sorts_config=None):
                 break
             cursor = data["next_cursor"]
 
-    print(f"  [蹇収] {sampled_at}  淇濆瓨 {total} 鏉?鈫?{snapshots_path.name}")
+    print(f"  [snapshot] {sampled_at} saved {total} rows -> {snapshots_path.name}")
     return total
 
 
 def seed_snapshots(out: Path, min_score: int = 1):
-    """
-    涓€娆℃€у皢 posts_all.jsonl 閲?score >= min_score 鐨勫笘瀛愭壒閲忓啓鍏?
-    post_snapshots.jsonl 浣滀负 T0 鍩虹嚎锛宻ort_source="seed"銆?
-
-    涔嬪悗姣忔 fetch_hot_snapshot 杩藉姞鐨勯兘鏄?T1/T2/T3...锛?
-    浠庤€屽彲浠ュ浠绘剰甯栧瓙鍋?score / comment_count 鐨勬椂搴忓垎鏋愩€?
-
-    宸叉湁鏉＄洰鐨勫笘瀛愪細琚烦杩囷紙鎸?post_id 鍘婚噸锛夛紝鎵€浠ュ娆¤繍琛屽畨鍏ㄣ€?
-    """
+    """Seed baseline snapshots from posts_all.jsonl using score threshold."""
     posts_path = out / "posts_all.jsonl"
     snapshots_path = out / "post_snapshots.jsonl"
     if not posts_path.exists():
         print("  [!] posts_all.jsonl missing")
         return
 
-    # 璇诲彇宸叉湁蹇収閲岀殑 post_id锛岃烦杩囧凡瀛樺湪鐨?
+    # post_id?
     existing_ids: set = set()
     if snapshots_path.exists():
         with open(snapshots_path, encoding="utf-8") as f:
@@ -1070,12 +1864,12 @@ def seed_snapshots(out: Path, min_score: int = 1):
                     existing_ids.add(json.loads(line)["post_id"])
                 except Exception:
                     pass
-        print(f"  宸叉湁蹇収 {len(existing_ids):,} 鏉★紝璺宠繃閲嶅")
+        print(f"  existing snapshots: {len(existing_ids):,}, skip duplicates")
 
     written = skipped_score = 0
     scanned = 0
-    print(f"  鎵弿 posts_all.jsonl锛坰core >= {min_score} 鐨勫笘瀛愪綔涓?T0锛?..")
-    with open(posts_path, encoding="utf-8") as fin, \
+    print(f"  scanning posts_all.jsonl (score >= {min_score}) to seed T0 snapshot...")
+    with open(posts_path, encoding="utf-8") as fin,\
          open(snapshots_path, "a", encoding="utf-8") as fout:
         for line in fin:
             line = line.strip()
@@ -1083,7 +1877,7 @@ def seed_snapshots(out: Path, min_score: int = 1):
                 continue
             scanned += 1
             if scanned % 500_000 == 0:
-                print(f"    宸叉壂鎻?{scanned:,} 琛岋紝宸插啓鍏?{written:,} 鏉?..")
+                print(f"    scanned {scanned:,} rows, written {written:,} rows...")
             try:
                 p = json.loads(line)
                 if p.get("score", 0) < min_score:
@@ -1092,7 +1886,7 @@ def seed_snapshots(out: Path, min_score: int = 1):
                 pid = p.get("id")
                 if not pid or pid in existing_ids:
                     continue
-                # T0 鏃堕棿锛氫紭鍏堢敤 _scraped_at锛屽叾娆＄敤 created_at
+                # T0 _scraped_at created_at
                 t0 = p.get("_scraped_at") or p.get("created_at", "")
                 snap = _snap_record(p, t0, "seed")
                 fout.write(json.dumps(snap, ensure_ascii=False) + "\n")
@@ -1101,8 +1895,11 @@ def seed_snapshots(out: Path, min_score: int = 1):
             except Exception:
                 pass
 
-    print(f"  [鈭歖 T0 seed 瀹屾垚锛氬啓鍏?{written:,} 鏉★紙score=0 璺宠繃 {skipped_score:,} 鏉★紝鍏辨壂鎻?{scanned:,} 琛岋級")
-    print(f"      鈫?{snapshots_path}")
+    print(
+        f"  [ok] T0 seed done: written {written:,} rows "
+        f"(score<{min_score} skipped {skipped_score:,}, scanned {scanned:,})"
+    )
+    print(f"      -> {snapshots_path}")
 
 
 def extract_agents(posts):
@@ -1114,45 +1911,58 @@ def extract_agents(posts):
     return list(agents.values())
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+#
 # STARTUP SUMMARY
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+#
 
 def show_startup_summary(checkpoint, local_posts, local_oldest, local_newest,
                          done_posts, total_eligible,
                          platform_total, platform_comments, platform_agents,
                          out, since_time, args):
-    """
-    姣忔杩愯寮€濮嬪墠鎵撳嵃锛氭湰鍦版暟鎹姸鎬?/ 骞冲彴鏁版嵁宸紓 / 鏈璁″垝銆?
-    鍏ㄩ儴浣跨敤缂撳瓨鍊硷紝涓嶆壂鎻忓ぇ鏂囦欢锛屽嚑涔庣灛鏃跺畬鎴愩€?
-    """
-    SEP = "鈹€" * 58
+    """Print startup overview: local status, platform stats, and run plan."""
+    SEP = "-" * 58
     auth_str = "AUTH" if "Authorization" in HEADERS else "ANON"
     print(f"\n{SEP}")
-    print(f"  Moltbook Scraper v2  路  {datetime.now().strftime('%Y-%m-%d %H:%M')}  路  {auth_str}")
+    print(f"  Moltbook Scraper v2  -  {datetime.now().strftime('%Y-%m-%d %H:%M')}  -  {auth_str}")
     print(SEP)
 
-    # 鈹€鈹€ 鏈湴鏁版嵁 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-    print(f"\n  鏈湴鏁版嵁")
-    date_range = f"{local_oldest} 鈫?{local_newest}" if local_oldest else "锛堟殏鏃犳暟鎹級"
-    print(f"    甯栧瓙   {local_posts:>12,} 鏉? |  {date_range}")
+    #
+    print("\n  Local Data")
+    date_range = f"{local_oldest} -> {local_newest}" if local_oldest else "(no local data yet)"
+    print(f"    posts   {local_posts:>12,} rows  |  {date_range}")
 
     comments_jsonl = out / "comments_all.jsonl"
+    metrics_cache = checkpoint.data.get("local_metrics_cache", {}) if isinstance(checkpoint.data, dict) else {}
     if comments_jsonl.exists():
         size_mb = comments_jsonl.stat().st_size / 1024 / 1024
-        if total_eligible:
+        if total_eligible and total_eligible >= done_posts:
             pct_done = done_posts / total_eligible * 100 if total_eligible else 0
-            coverage = f"宸插畬鎴?{done_posts:,} / {total_eligible:,} 甯? |  瑕嗙洊鐜?{pct_done:.1f}%"
+            coverage = (
+                f"eligible-post progress (done-cache): {done_posts:,} / {total_eligible:,} posts  "
+                f"|  indicator {pct_done:.1f}%"
+            )
         elif done_posts:
-            coverage = f"宸插畬鎴?{done_posts:,} 甯栵紙鎬婚噺寰呴娆℃壂鎻忕‘璁わ級"
+            coverage = f"eligible-post progress (done-cache): {done_posts:,} posts (total eligible pending refresh)"
         else:
-            coverage = "缂撳瓨寰呭缓绔嬶紙棣栨杩愯璇勮鎶撳彇鏃惰嚜鍔ㄥ垱寤猴級"
-        print(f"    璇勮   {size_mb:>11.0f} MB  |  {coverage}")
+            coverage = "cache not built yet (auto-built in comments stage)"
+        print(f"    comments {size_mb:>9.0f} MB  |  {coverage}")
+        print("              note: this is cache indicator, not full platform comment-row coverage")
+        cm_rows = _to_int(metrics_cache.get("comments_rows"), 0)
+        cm_unique = _to_int(metrics_cache.get("comments_unique"), 0)
+        cm_at = str(metrics_cache.get("updated_at", "") or "")
+        if cm_rows > 0 and cm_unique > 0:
+            uid_pct = (cm_unique / platform_comments * 100.0) if platform_comments else 0.0
+            print(
+                f"              cached local comments rows/uid: {cm_rows:,}/{cm_unique:,}  "
+                f"|  uid coverage~{uid_pct:.1f}%"
+            )
+            if cm_at:
+                print(f"              cache timestamp: {cm_at[:19]}")
     else:
-        print(f"    璇勮   锛堝皻鏃犺瘎璁烘暟鎹級")
+        print("    comments (no local comments data yet)")
 
-    # 鈹€鈹€ 骞冲彴鏁版嵁 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-    print(f"\n  骞冲彴鏁版嵁 (API)")
+    #
+    print("\n  Platform Data (API)")
     if platform_total:
         gap = max(0, platform_total - local_posts)
         pct = local_posts / platform_total * 100
@@ -1164,7 +1974,7 @@ def show_startup_summary(checkpoint, local_posts, local_oldest, local_newest,
     if platform_agents:
         print(f"    agents   {platform_agents:>11,}")
 
-    # 鈹€鈹€ 鏈璁″垝 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    #
     print("\n  Plan")
     if args.comments_only:
         print("  - posts: skip (--comments-only)")
@@ -1179,21 +1989,29 @@ def show_startup_summary(checkpoint, local_posts, local_oldest, local_newest,
         print("  - comments: skip (--no-comments)")
     else:
         limit_str = f", top {args.max_comment_posts:,} posts" if args.max_comment_posts else ""
-        print(f"  - comments: comment_count >= {args.min_comments}{limit_str}, workers={args.workers}")
+        print(
+            f"  - comments: comment_count >= {args.min_comments}{limit_str}, "
+            f"workers={args.workers}, queue={args.comment_queue_strategy}, id_cache={args.comment_id_cache}"
+        )
+        if args.comment_queue_strategy == "layered":
+            print(
+                f"    layers: small<={args.queue_small_max}, "
+                f"medium<={args.queue_medium_max}, long>{args.queue_medium_max}"
+            )
     print(f"  - rate: posts~{args.read_rpm}/min, comments~{args.comment_rpm}/min")
     if args.no_resume:
         print("  - resume: ignore/clear (--no-resume)")
 
-    print(f"\n  鏁版嵁鐩綍: {out}/")
+    print(f"\n  data dir: {out}/")
     print(f"{SEP}\n")
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+#
 # CLEAN RUNS
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+#
 
 def clean_runs(out: Path, keep_last: int = 0):
-    """鍒犻櫎 data/runs/ 杩愯蹇収鏂囦欢锛岄噴鏀剧鐩樼┖闂淬€?"""
+    """Delete data/runs snapshots and optionally keep latest N files."""
     runs_dir = out / "runs"
     if not runs_dir.exists():
         print("  runs/ directory not found.")
@@ -1212,23 +2030,23 @@ def clean_runs(out: Path, keep_last: int = 0):
         kept = 0
 
     del_size_mb = sum(f.stat().st_size for f in to_delete) / 1024 / 1024
-    print(f"  runs/ 鐩綍: {len(files)} 涓枃浠讹紝鍏?{total_size_mb:.1f} MB")
+    print(f"  runs/ dir: {len(files)} files, total {total_size_mb:.1f} MB")
     if not to_delete:
         print(f"  keep latest {kept}, nothing to delete.")
         return
 
-    print(f"  鍒犻櫎 {len(to_delete)} 涓枃浠讹紝閲婃斁绾?{del_size_mb:.1f} MB锛堜繚鐣欐渶杩?{kept} 涓級...")
+    print(f"  deleting {len(to_delete)} files, freeing ~{del_size_mb:.1f} MB (keep latest {kept})...")
     for f in to_delete:
         f.unlink()
     print(f"  done. kept {kept} run snapshot files.")
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+#
 # DATA CHECK / DEDUP / REFETCH
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+#
 
 def dedup_comments(out: Path):
-    """娴佸紡鍘婚噸 comments_all.jsonl锛堟寜 id 瀛楁锛夛紝鍘熷湴鏇挎崲銆?"""
+    """Deduplicate comments_all.jsonl by comment id in place."""
     comments_path = out / "comments_all.jsonl"
     if not comments_path.exists():
         print("  [!] comments_all.jsonl missing")
@@ -1236,8 +2054,8 @@ def dedup_comments(out: Path):
     tmp_path = comments_path.with_suffix(".dedup_tmp")
     seen = set()
     total = kept = 0
-    print("鍘婚噸 comments_all.jsonl锛堟寜 id 瀛楁锛?..")
-    with open(comments_path, encoding="utf-8") as fin, \
+    print("deduplicating comments_all.jsonl by comment id...")
+    with open(comments_path, encoding="utf-8") as fin,\
          open(tmp_path, "w", encoding="utf-8") as fout:
         for line in fin:
             line = line.strip()
@@ -1247,80 +2065,127 @@ def dedup_comments(out: Path):
             try:
                 obj = json.loads(line)
                 cid = obj.get("id")
-                if cid and cid not in seen:
-                    seen.add(cid)
+                if not cid:
+                    # The scrape path deliberately keeps id-less rows; dedup
+                    # must not drop them.
+                    fout.write(line + "\n")
+                    kept += 1
+                    continue
+                key = (obj.get("post_id") or "", cid)
+                if key not in seen:
+                    seen.add(key)
                     fout.write(line + "\n")
                     kept += 1
             except Exception:
-                fout.write(line + "\n")  # 淇濈暀鍧忚锛?-check 浼氭姤鍛?
+                fout.write(line + "\n")  # ?-check ?
                 kept += 1
     removed = total - kept
-    print(f"  鍘熷琛屾暟: {total:,}  鈫? 鍘婚噸鍚? {kept:,}  锛堝垹闄?{removed:,} 鏉￠噸澶嶏級")
+    print(f"  rows before: {total:,}  ->  after dedup: {kept:,}  (removed {removed:,} duplicates)")
     tmp_path.replace(comments_path)
-    print("  [鈭歖 瀹屾垚锛屽凡鍘熷湴鏇挎崲 comments_all.jsonl")
+    print("  [ok] done; replaced comments_all.jsonl in-place")
 
 
 def refetch_comments(out: Path, min_count: int):
-    """
-    浠?done_cache 绉婚櫎 comment_count >= min_count 鐨勫笘瀛愶紝浣垮叾涓嬫閲嶆柊鍏ㄩ噺鎶撳彇銆?
-    鐢ㄤ簬琛ユ晳鍘嗗彶涓婂彧鎶撲簡绗竴椤电殑甯栧瓙銆?
-    閲嶆姄鍚庝細鏈夐噸澶嶇涓€椤电殑璇勮锛岄渶瑕佽窇 --dedup-comments 娓呯悊銆?
-    """
+    """Force re-sync for posts above threshold by resetting cache/cooldown/resume state."""
     done_cache_path = out / "comments_done_posts.txt"
     posts_path = out / "posts_all.jsonl"
+    resume_cache_path = out / "comments_resume_cursor.jsonl"
+    sync_state_path = out / "comments_post_sync_state.jsonl"
     if not done_cache_path.exists():
-        print("  [!] comments_done_posts.txt 涓嶅瓨鍦紝鏃犻渶澶勭悊")
-        return
+        print("  [!] comments_done_posts.txt not found; nothing to refetch-reset")
+        done_ids = set()
+    else:
+        done_ids = set()
+        with open(done_cache_path, encoding="utf-8") as f:
+            for line in f:
+                pid = line.strip()
+                if pid:
+                    done_ids.add(pid)
     if not posts_path.exists():
         print("  [!] posts_all.jsonl missing")
         return
-    done_ids = set()
-    with open(done_cache_path, encoding="utf-8") as f:
-        for line in f:
-            pid = line.strip()
-            if pid:
-                done_ids.add(pid)
-    to_remove = set()
-    scanned = 0
+
+    target_ids = set()
     with open(posts_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            scanned += 1
             try:
                 p = json.loads(line)
-                if p.get("comment_count", 0) >= min_count and p["id"] in done_ids:
-                    to_remove.add(p["id"])
+                pid = p.get("id")
+                if pid and p.get("comment_count", 0) >= min_count:
+                    target_ids.add(pid)
             except Exception:
                 pass
-    if not to_remove:
-        print(f"  [鈭歖 娌℃湁 comment_count >= {min_count} 鐨勫凡鎶撳笘瀛愶紝鏃犻渶閲嶇疆")
+    if not target_ids:
+        print(f"  [ok] no posts with comment_count >= {min_count}; nothing to reset")
         return
-    new_done = done_ids - to_remove
-    with open(done_cache_path, "w", encoding="utf-8") as f:
-        for pid in new_done:
-            f.write(pid + "\n")
-    print(f"  removed {len(to_remove):,} posts from done_cache (comment_count >= {min_count})")
-    print(f"  remaining done posts: {len(new_done):,}")
-    print("  next: python -X utf8 scraper.py --workers 5")
-    print("  then: python -X utf8 scraper.py --dedup-comments")
+
+    # 1) done-cache reset for target posts
+    removed_done = len(done_ids & target_ids)
+    if done_cache_path.exists():
+        new_done = done_ids - target_ids
+        with open(done_cache_path, "w", encoding="utf-8") as f:
+            for pid in new_done:
+                f.write(pid + "\n")
+    else:
+        new_done = set()
+
+    # 2) clear resume cursors for target posts
+    resume_reset = 0
+    if resume_cache_path.exists():
+        rc = CommentsResumeCache(resume_cache_path)
+        for pid in target_ids:
+            if rc.get(pid):
+                rc.set(pid, None)
+                resume_reset += 1
+        rc.compact_if_needed(force=True)
+
+    # 3) clear cooldown / force retry for target posts
+    sync_reset = 0
+    if sync_state_path.exists():
+        ss = CommentsPostSyncState(sync_state_path)
+        sync_reset = ss.force_retry(target_ids)
+        ss.compact_if_needed(force=True)
+
+    print(f"  target posts (comment_count >= {min_count}): {len(target_ids):,}")
+    print(f"  done-cache removed: {removed_done:,}  |  remaining done posts: {len(new_done):,}")
+    print(f"  resume cursors cleared: {resume_reset:,}")
+    print(f"  sync-state forced retry: {sync_reset:,}")
+    print("  next: run comments backfill again (comments-only recommended)")
 
 
-def check_data(out: Path):
-    """鑷鏁版嵁鐩綍锛氱粺璁℃枃浠跺畬鏁存€с€佸幓閲嶆儏鍐点€佹棩鏈熻寖鍥淬€乧heckpoint 鐘舵€併€?"""
-    print(f"\n=== 鏁版嵁鑷  ({out}/) ===\n")
+def check_data(out: Path, min_comments: int = 1, fast: bool = False, sample_posts: int = 0):
+    """Check local files, integrity, and coverage using a configurable eligible threshold."""
+    print(f"\n=== Data Check ({out}/) ===\n")
+
+    threshold = max(int(min_comments), 0)
+    comment_rows_by_post = Counter()
+    comment_unique_by_post = Counter()
+    seen_comment_pairs = set()
+    eligible_done_pct = None
+    scan_stats = {}
+    cp_cache_path = out / "checkpoint.json"
+    cached_metrics = {}
+    if cp_cache_path.exists():
+        try:
+            with open(cp_cache_path, encoding="utf-8") as f:
+                cp_cache_obj = json.load(f)
+            cached_metrics = cp_cache_obj.get("local_metrics_cache", {}) if isinstance(cp_cache_obj, dict) else {}
+        except Exception:
+            cached_metrics = {}
 
     files = [
-        ("posts_all.jsonl",    "甯栧瓙"),
-        ("comments_all.jsonl", "璇勮"),
-        ("agents_seen.jsonl",  "Agent妗ｆ"),
+        ("posts_all.jsonl",    "posts"),
+        ("comments_all.jsonl", "comments"),
+        ("agents_seen.jsonl",  "agents"),
     ]
 
     for filename, label in files:
         path = out / filename
         if not path.exists():
-            print(f"  [{label}] {filename}: 鏂囦欢涓嶅瓨鍦╘n")
+            print(f"  [{label}] {filename}: missing\n")
             continue
 
         size_mb = path.stat().st_size / 1024 / 1024
@@ -1328,9 +2193,23 @@ def check_data(out: Path):
         ids = set()
         dates = []
 
-        # 鎵弿 comments_all.jsonl 鏃堕『渚挎敹闆?post_id锛堢敤浜庡缓绔嬭繘搴︾紦瀛橈級
+        # While scanning comments, collect post_id for done-cache bootstrap.
         collect_post_ids = (filename == "comments_all.jsonl")
         seen_post_ids_for_cache = set() if collect_post_ids else None
+        if collect_post_ids and fast:
+            rows_cached = _to_int(cached_metrics.get("comments_rows"), 0)
+            unique_cached = _to_int(cached_metrics.get("comments_unique"), 0)
+            updated_at = str(cached_metrics.get("updated_at", "") or "")
+            scan_stats[label] = {"rows": rows_cached, "unique": unique_cached}
+            print(f"  [{label}] {filename}")
+            print(
+                f"    size: {size_mb:.1f} MB  |  rows: {rows_cached:,} (cached)  |  unique_id: {unique_cached:,} (cached)"
+            )
+            print("    [fast] skipped full comments file scan")
+            if updated_at:
+                print(f"    cache timestamp: {updated_at[:19]}")
+            print()
+            continue
 
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -1346,15 +2225,28 @@ def check_data(out: Path):
                         dates.append(d)
                     if collect_post_ids and (pid := obj.get("post_id")):
                         seen_post_ids_for_cache.add(pid)
+                        comment_rows_by_post[pid] += 1
+                        cid = obj.get("id")
+                        if cid:
+                            pair_fp = _pair_fingerprint(pid, cid)
+                            if pair_fp not in seen_comment_pairs:
+                                seen_comment_pairs.add(pair_fp)
+                                comment_unique_by_post[pid] += 1
+                        else:
+                            comment_unique_by_post[pid] += 1
                 except Exception:
                     bad_lines += 1
 
         dupes = total_lines - len(ids)
+        scan_stats[label] = {"rows": total_lines, "unique": len(ids)}
         print(f"  [{label}] {filename}")
-        print(f"    澶у皬: {size_mb:.1f} MB  |  鎬昏: {total_lines:,}  |  鍞竴ID: {len(ids):,}  |  閲嶅: {dupes}  |  鎹熷潖琛? {bad_lines}")
+        print(
+            f"    size: {size_mb:.1f} MB  |  rows: {total_lines:,}  |  unique_id: {len(ids):,}  |  "
+            f"dupes: {dupes}  |  bad_json: {bad_lines}"
+        )
         if dates:
             d_min, d_max = min(dates), max(dates)
-            print(f"    鏃ユ湡鑼冨洿: {d_min[:19]} 鈫?{d_max[:19]}")
+            print(f"    date range: {d_min[:19]} -> {d_max[:19]}")
             if filename == "posts_all.jsonl":
                 daily = Counter(d[:10] for d in dates)
                 d_start = date_type.fromisoformat(d_min[:10])
@@ -1372,37 +2264,58 @@ def check_data(out: Path):
                         sparse.append((ds, cnt))
                     cur += timedelta(days=1)
                 if missing:
-                    print(f"    [!] 鏂。 {len(missing)} 澶╋紙0 鏉″笘瀛愶級: {missing}")
+                    print(f"    [!] missing {len(missing)} day(s) with 0 posts: {missing}")
                 else:
                     print(f"    [ok] date contiguous, no missing day ({total_days} days, avg {int(avg_per_day):,}/day)")
                 if sparse:
-                    print(f"    [?] 绋€鐤忓ぉ锛? 鍧囧€?5%锛? {[(d, f'{n:,}') for d, n in sparse]}")
+                    print(f"    [?] sparse days (<5% avg): {[(d, f'{n:,}') for d, n in sparse]}")
         if bad_lines:
             print(f"    [!] {bad_lines} JSON parse errors (possibly truncated lines)")
         if dupes > 0:
             print(f"    [!] found {dupes} duplicate records")
 
-        # comments 鎵畬鍚庨『鎵嬪缓杩涘害缂撳瓨
+        # comments -> build done-cache if absent
         if collect_post_ids and seen_post_ids_for_cache:
             done_cache_path = out / "comments_done_posts.txt"
             if not done_cache_path.exists():
                 with open(done_cache_path, "w", encoding="utf-8") as f:
                     for pid in seen_post_ids_for_cache:
                         f.write(pid + "\n")
-                print(f"    [+] 宸插缓绔嬭瘎璁鸿繘搴︾紦瀛橈紙{len(seen_post_ids_for_cache):,} 甯栵級")
+                print(f"    [+] built comments_done_posts cache ({len(seen_post_ids_for_cache):,} posts)")
         print()
 
-    # 璇勮杩涘害缂撳瓨
+    # comments progress cache (legacy indicator only)
     done_cache_path = out / "comments_done_posts.txt"
+    done_ids = set()
     if done_cache_path.exists():
-        done_count = sum(1 for line in open(done_cache_path, encoding="utf-8") if line.strip())
-        print(f"  [璇勮杩涘害缂撳瓨] comments_done_posts.txt: {done_count:,} 甯栧凡瀹屾垚")
+        done_ids = {line.strip() for line in open(done_cache_path, encoding="utf-8") if line.strip()}
+        done_count = len(done_ids)
+        print(f"  [comments cache] comments_done_posts.txt: {done_count:,} posts marked done")
+    else:
+        print("  [comments cache] comments_done_posts.txt not found yet")
 
-        # 缁熻鏈夊灏戝笘瀛愮鍚?>=5 鏉′欢浣嗚繕娌℃姄
-        posts_path = out / "posts_all.jsonl"
-        if posts_path.exists():
-            done_ids = {line.strip() for line in open(done_cache_path, encoding="utf-8") if line.strip()}
-            total_eligible = pending = 0
+    # Strict audit: compare post.comment_count vs real local comment rows per post.
+    posts_path = out / "posts_all.jsonl"
+    def _keep_top(items, score, pid, expected, got, limit=5):
+        rec = (score, pid, expected, got)
+        if len(items) < limit:
+            items.append(rec)
+            items.sort(key=lambda x: x[0], reverse=True)
+            return
+        if score > items[-1][0]:
+            items[-1] = rec
+            items.sort(key=lambda x: x[0], reverse=True)
+
+    if fast:
+        print("  [comment_count audit]")
+        print("    fast mode enabled: skipped strict per-post expected vs local audit")
+        if sample_posts > 0 and posts_path.exists():
+            sample_n = max(1, _to_int(sample_posts, 0))
+            print(f"    sampled strict audit enabled: target {sample_n:,} posts (comment_count >= {threshold})")
+
+            rng = random.Random(42)
+            sample_pairs = []
+            eligible_seen = 0
             with open(posts_path, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
@@ -1410,16 +2323,206 @@ def check_data(out: Path):
                         continue
                     try:
                         p = json.loads(line)
-                        if p.get("comment_count", 0) >= 5:
-                            total_eligible += 1
-                            if p["id"] not in done_ids:
-                                pending += 1
+                        pid = p.get("id")
+                        if not pid:
+                            continue
+                        expected = max(0, _to_int(p.get("comment_count"), 0))
                     except Exception:
-                        pass
-            pct = f"{done_count / total_eligible * 100:.1f}%" if total_eligible else "?"
-            print(f"    绗﹀悎鏉′欢甯栵紙鈮?鏉¤瘎璁猴級: {total_eligible:,}  |  宸叉姄: {done_count:,}  |  寰呮姄: {pending:,}  |  瑕嗙洊鐜? {pct}")
+                        continue
+                    if expected < threshold:
+                        continue
+                    eligible_seen += 1
+                    rec = (pid, expected)
+                    if len(sample_pairs) < sample_n:
+                        sample_pairs.append(rec)
+                    else:
+                        j = rng.randint(1, eligible_seen)
+                        if j <= sample_n:
+                            sample_pairs[j - 1] = rec
+
+            if sample_pairs:
+                sample_ids = {pid for pid, _ in sample_pairs}
+                sample_counts = Counter()
+                comments_path = out / "comments_all.jsonl"
+                used_sqlite = False
+                if comments_path.exists():
+                    cache_candidates = [
+                        out / "comments_id_cache.sqlite",
+                        out / "comments_id_cache_check.sqlite",
+                    ]
+                    # --check runs lock-exempt; if a live scraper holds the
+                    # lock, don't write-seed its sqlite cache out from under it
+                    # (WAL allows it silently, and contention surfaces as
+                    # swallowed callback errors in the live run).
+                    _live_lock = out / "scraper.lock"
+                    if _live_lock.exists():
+                        try:
+                            _ld = json.loads(_live_lock.read_text(encoding="utf-8"))
+                            if _pid_alive(_to_int(_ld.get("pid"), 0)):
+                                print("    [sample] live scraper detected; using dedicated check cache only.")
+                                cache_candidates = cache_candidates[1:]
+                        except Exception:
+                            pass
+                    for idx, cache_path in enumerate(cache_candidates):
+                        sample_store = None
+                        try:
+                            sample_store = CommentsIdStore(
+                                mode="sqlite",
+                                sqlite_path=cache_path,
+                            )
+                            sample_store.seed_from_comments_file(comments_path, sample_ids)
+                            sample_counts = Counter(sample_store.count_for_posts(sample_ids))
+                            used_sqlite = True
+                            if idx == 1:
+                                print(f"    [sample] using dedicated sqlite cache: {cache_path.name}")
+                            break
+                        except Exception as e:
+                            err_txt = str(e)
+                            if idx == 0 and "locked" in err_txt.lower():
+                                print("    [sample] shared sqlite cache is locked; trying dedicated cache...")
+                            else:
+                                print(f"    [sample] sqlite cache unavailable ({cache_path.name}): {e}")
+                        finally:
+                            if sample_store:
+                                sample_store.close()
+                    if not used_sqlite:
+                        print("    [sample] fallback to one-pass comments scan for sample posts")
+                        sample_counts = _count_comments_for_target_posts(comments_path, sample_ids, strict_unique=True)
+
+                sample_exact = sample_under = sample_over = 0
+                sample_expected = sample_local = sample_gap = 0
+                top_under = []
+                top_over = []
+                for pid, expected in sample_pairs:
+                    got = int(sample_counts.get(pid, 0))
+                    sample_expected += expected
+                    sample_local += got
+                    if got == expected:
+                        sample_exact += 1
+                    elif got < expected:
+                        sample_under += 1
+                        miss = expected - got
+                        sample_gap += miss
+                        _keep_top(top_under, miss, pid, expected, got)
+                    else:
+                        sample_over += 1
+                        _keep_top(top_over, got - expected, pid, expected, got)
+
+                source = "sqlite id cache" if used_sqlite else "comments scan"
+                print(f"    sampled posts: {len(sample_pairs):,} / eligible~{eligible_seen:,}  |  source: {source}")
+                print(
+                    f"    sample exact={sample_exact:,}  |  under={sample_under:,}  |  over={sample_over:,}  "
+                    f"|  expected~{sample_expected:,}  |  local unique~{sample_local:,}  |  gap~{sample_gap:,}"
+                )
+                if top_under:
+                    print("    sample top underfilled:")
+                    for miss, pid, exp, got in top_under:
+                        print(f"      {pid[:8]}...  {exp:,}/{got:,}  missing~{miss:,}")
+                if top_over:
+                    print("    sample top overfilled:")
+                    for extra, pid, exp, got in top_over:
+                        print(f"      {pid[:8]}...  {exp:,}/{got:,}  extra~{extra:,}")
+            else:
+                print("    sampled strict audit skipped: no eligible posts found")
+        elif sample_posts > 0 and not posts_path.exists():
+            print("    sampled strict audit skipped: posts_all.jsonl missing")
+        else:
+            print("    tip: add --check-sample-posts N to run sampled strict audit in fast mode")
+        print("    run without --check-fast for full audit")
+        print()
+    elif posts_path.exists():
+        total_posts_audited = 0
+        all_exact = all_under = all_over = 0
+        total_expected_all = total_local_all_unique = total_local_all_rows = 0
+        top_under = []
+        top_over = []
+
+        total_eligible = pending = done_eligible = exact = overfilled = 0
+        total_expected = total_local_unique = total_local_rows = total_gap = 0
+        done_by_cache = 0
+
+        with open(posts_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    p = json.loads(line)
+                    pid = p.get("id")
+                    if not pid:
+                        continue
+                    expected = max(0, _to_int(p.get("comment_count"), 0))
+                    got_unique = int(comment_unique_by_post.get(pid, 0))
+                    got_rows = int(comment_rows_by_post.get(pid, 0))
+                except Exception:
+                    continue
+
+                total_posts_audited += 1
+                total_expected_all += expected
+                total_local_all_unique += got_unique
+                total_local_all_rows += got_rows
+
+                if got_unique == expected:
+                    all_exact += 1
+                elif got_unique < expected:
+                    all_under += 1
+                    _keep_top(top_under, expected - got_unique, pid, expected, got_unique)
+                else:
+                    all_over += 1
+                    _keep_top(top_over, got_unique - expected, pid, expected, got_unique)
+
+                if expected >= threshold:
+                    total_eligible += 1
+                    total_expected += expected
+                    total_local_unique += got_unique
+                    total_local_rows += got_rows
+                    if pid in done_ids:
+                        done_by_cache += 1
+                    if got_unique >= expected:
+                        done_eligible += 1
+                        if got_unique == expected:
+                            exact += 1
+                        else:
+                            overfilled += 1
+                    else:
+                        pending += 1
+                        total_gap += (expected - got_unique)
+
+        delta_all = total_local_all_unique - total_expected_all
+        print("  [comment_count audit]")
+        print(
+            f"    all posts audited: {total_posts_audited:,}  |  exact={all_exact:,}  "
+            f"|  under={all_under:,}  |  over={all_over:,}"
+        )
+        print(
+            f"    expected comments~{total_expected_all:,}  |  local unique~{total_local_all_unique:,}  "
+            f"|  delta(unique-expected) {delta_all:+,}"
+        )
+        print(f"    local raw rows~{total_local_all_rows:,}")
+        if top_under:
+            print("    top underfilled posts (expected/local, missing):")
+            for miss, pid, exp, got in top_under:
+                print(f"      {pid[:8]}...  {exp:,}/{got:,}  missing~{miss:,}")
+        if top_over:
+            print("    top overfilled posts (expected/local, extra):")
+            for extra, pid, exp, got in top_over:
+                print(f"      {pid[:8]}...  {exp:,}/{got:,}  extra~{extra:,}")
+
+        pct = f"{done_eligible / total_eligible * 100:.1f}%" if total_eligible else "?"
+        eligible_done_pct = (done_eligible / total_eligible * 100.0) if total_eligible else None
+        print(
+            f"    eligible posts (>={threshold} comments): {total_eligible:,}  |  "
+            f"done(aligned): {done_eligible:,}  |  pending: {pending:,}  |  coverage: {pct}"
+        )
+        print(
+            f"    expected~{total_expected:,}  |  local unique~{total_local_unique:,}  |  gap~{total_gap:,}  "
+            f"|  exact={exact:,} overfilled={overfilled:,}"
+        )
+        print(f"    local raw rows (eligible only)~{total_local_rows:,}")
+        if done_ids:
+            print(f"    cache-only view (legacy): done(in threshold by cache) {done_by_cache:,}")
     else:
-        print("  [comments cache] comments_done_posts.txt not found yet")
+        print("  [comment_count audit] posts_all.jsonl missing; skip strict comment audit")
     print()
 
     # Checkpoint
@@ -1428,36 +2531,32 @@ def check_data(out: Path):
         with open(cp_path, encoding="utf-8") as f:
             cp = json.load(f)
         print(f"  [Checkpoint]")
-        print(f"    鏈€鏂板笘瀛愭椂闂? {cp.get('newest_post_created_at') or '鏃狅紙鏈畬鎴愬叏閲忥級'}")
-        print(f"    杩愯娆℃暟: {len(cp.get('runs', []))}  |  宸茶褰曞笘瀛? {cp.get('total_posts', 0):,}  |  宸茶褰曡瘎璁? {cp.get('total_comments', 0):,}")
+        print(f"    newest post time: {cp.get('newest_post_created_at') or 'none (full crawl not completed yet)'}")
+        print(
+            f"    runs: {len(cp.get('runs', []))}  |  "
+            f"recorded posts: {cp.get('total_posts', 0):,}  |  recorded comments: {cp.get('total_comments', 0):,}"
+        )
         if cp.get("_resume_cursor"):
-            print(f"    [!] 鏈夋湭瀹屾垚鐨勪腑鏂换鍔★紙_resume_cursor 瀛樺湪锛夆啋 鐢?--full 缁х画")
+            print("    [!] unfinished resume cursor exists (_resume_cursor). Run with --full to continue.")
         print()
 
-    # Runs 鐩綍
+    # runs/ snapshots
     runs_dir = out / "runs"
     if runs_dir.exists():
         run_files = sorted(runs_dir.glob("*.jsonl"))
         total_size = sum(f.stat().st_size for f in run_files) / 1024 / 1024
-        print(f"  [杩愯蹇収] {len(run_files)} 涓枃浠? |  鎬诲ぇ灏? {total_size:.1f} MB")
+        print(f"  [runs snapshots] {len(run_files)} files | total size {total_size:.1f} MB")
         if run_files:
-            print(f"    鏈€鏂? {run_files[-1].name}")
+            print(f"    latest: {run_files[-1].name}")
         if total_size > 500:
             print("    [tip] runs snapshots are large; use --clean-runs")
     print()
 
-    # 骞冲彴瀹炴椂鏁版嵁瀵规瘮
-    print("  [骞冲彴瀵规瘮] 姝ｅ湪璇锋眰骞冲彴瀹炴椂鏁版嵁...")
-    stats = fetch_platform_stats()
-    if not stats:
-        print("    [!] 鏃犳硶鑾峰彇骞冲彴鏁版嵁锛圓PI 瓒呮椂鎴栭檺閫燂級锛岃烦杩囧姣擻n")
-        return
+    # platform comparison
+    print("  [platform compare] fetching live platform stats...")
+    platform_posts = platform_comments = platform_agents = 0
 
-    platform_posts    = int(stats.get("totalPosts",    0) or 0)
-    platform_comments = int(stats.get("totalComments", 0) or 0)
-    platform_agents   = int(stats.get("totalAgents",   0) or 0)
-
-    # 璇绘湰鍦拌鏁帮紙澶嶇敤宸叉壂鎻忚繃鐨?ids锛?
+    # ?ids?
     def count_jsonl(path):
         if not path.exists():
             return 0
@@ -1468,9 +2567,37 @@ def check_data(out: Path):
                     n += 1
         return n
 
-    local_posts    = count_jsonl(out / "posts_all.jsonl")
-    local_comments = count_jsonl(out / "comments_all.jsonl")
-    local_agents   = count_jsonl(out / "agents_seen.jsonl")
+    local_posts_rows = scan_stats.get("posts", {}).get("rows", count_jsonl(out / "posts_all.jsonl"))
+    local_posts_unique = scan_stats.get("posts", {}).get("unique", local_posts_rows)
+    local_comments_rows = scan_stats.get("comments", {}).get("rows", count_jsonl(out / "comments_all.jsonl"))
+    local_comments_unique = scan_stats.get("comments", {}).get("unique", local_comments_rows)
+    local_agents_rows = scan_stats.get("agents", {}).get("rows", count_jsonl(out / "agents_seen.jsonl"))
+    if cp_cache_path.exists():
+        try:
+            with open(cp_cache_path, encoding="utf-8") as f:
+                cp_data = json.load(f)
+            cp_data["local_metrics_cache"] = {
+                "posts_rows": local_posts_rows,
+                "posts_unique": local_posts_unique,
+                "comments_rows": local_comments_rows,
+                "comments_unique": local_comments_unique,
+                "agents_rows": local_agents_rows,
+                "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            tmp = cp_cache_path.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cp_data, f, ensure_ascii=False, indent=2)
+            tmp.replace(cp_cache_path)
+        except Exception:
+            pass
+
+    stats = fetch_platform_stats()
+    if not stats:
+        print("    [!] cannot fetch platform stats (timeout or rate-limited), skip comparison.\n")
+        return
+    platform_posts    = int(stats.get("totalPosts",    0) or 0)
+    platform_comments = int(stats.get("totalComments", 0) or 0)
+    platform_agents   = int(stats.get("totalAgents",   0) or 0)
 
     def fmt_pct(local, total):
         if not total:
@@ -1481,19 +2608,123 @@ def check_data(out: Path):
 
     print(f"  {'type':<10} {'local':>12} {'platform':>12} {'coverage':>10}")
     print(f"  {'-'*48}")
-    print(f"  {'posts':<10} {local_posts:>12,} {platform_posts:>12,} {fmt_pct(local_posts, platform_posts):>10}")
-    print(f"  {'comments':<10} {local_comments:>12,} {platform_comments:>12,} {fmt_pct(local_comments, platform_comments):>10}")
-    print(f"  {'agents':<10} {local_agents:>12,} {platform_agents:>12,} {fmt_pct(local_agents, platform_agents):>10}")
+    print(f"  {'posts':<10} {local_posts_rows:>12,} {platform_posts:>12,} {fmt_pct(local_posts_rows, platform_posts):>10}")
+    print(f"  {'cmts(rows)':<10} {local_comments_rows:>12,} {platform_comments:>12,} {fmt_pct(local_comments_rows, platform_comments):>10}")
+    print(f"  {'cmts(uid)':<10} {local_comments_unique:>12,} {platform_comments:>12,} {fmt_pct(local_comments_unique, platform_comments):>10}")
+    print(f"  {'agents':<10} {local_agents_rows:>12,} {platform_agents:>12,} {fmt_pct(local_agents_rows, platform_agents):>10}")
+    post_cov = (local_posts_unique / platform_posts * 100.0) if platform_posts else None
+    comment_cov = (local_comments_unique / platform_comments * 100.0) if platform_comments else None
+    if post_cov is not None and comment_cov is not None:
+        delta = post_cov - comment_cov
+        miss_posts = max(0, platform_posts - local_posts_unique)
+        miss_comments = max(0, platform_comments - local_comments_unique)
+        print("  [coverage diff]")
+        print(
+            f"    platform coverage (unique-first): posts {post_cov:.1f}% vs comments {comment_cov:.1f}%  |  delta {delta:+.1f} pp"
+        )
+        print(f"    missing unique rows: posts ~{miss_posts:,}  |  comments ~{miss_comments:,}")
+        if eligible_done_pct is not None:
+            delta_align = post_cov - eligible_done_pct
+            print(
+                f"    aligned eligible (>= {threshold} comments): {eligible_done_pct:.1f}%  |  "
+                f"delta vs posts {delta_align:+.1f} pp"
+            )
     print()
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+#
 # MAIN
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+#
+
+#
+# CROSS-PROCESS LOCK
+#
+# Shared with auto_scheduler.py (same file, same format). auto_scheduler
+# acquires it before launching scraper.py and passes MOLT_LOCK_INHERITED=1
+# so the child does not refuse its own parent's lock.
+
+_LOCK_INHERITED_ENV = "MOLT_LOCK_INHERITED"
+
+
+def _pid_alive(pid: int) -> bool:
+    if not pid:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def acquire_scraper_lock(lock_path: Path) -> bool:
+    """Take the cross-process lock. Returns False if another live run holds it."""
+    if os.environ.get(_LOCK_INHERITED_ENV) == "1":
+        # Only honor inheritance when a live parent actually holds the lock;
+        # a lingering shell var must not silently disable locking.
+        try:
+            data = json.loads(lock_path.read_text(encoding="utf-8"))
+            if _pid_alive(_to_int(data.get("pid"), 0)):
+                return True
+        except Exception:
+            pass
+        print(f"  [lock] {_LOCK_INHERITED_ENV} set but no live parent lock; acquiring normally.")
+    for _ in range(2):
+        try:
+            with open(lock_path, "x", encoding="utf-8") as f:
+                json.dump({
+                    "pid": os.getpid(),
+                    "started": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "argv": sys.argv[1:],
+                }, f)
+            atexit.register(release_scraper_lock, lock_path)
+            return True
+        except FileExistsError:
+            try:
+                lock_data = json.loads(lock_path.read_text(encoding="utf-8"))
+                pid = _to_int(lock_data.get("pid"), 0)
+                started = lock_data.get("started", "?")
+            except Exception:
+                pid, started = 0, "?"
+            if _pid_alive(pid):
+                print(f"  [lock] another scraper is running (PID {pid}, started {started}); refusing to start.")
+                return False
+            print(f"  [lock] stale lock (PID {pid} not running); removing.")
+            try:
+                lock_path.unlink()
+            except OSError:
+                return False
+    return False
+
+
+def release_scraper_lock(lock_path: Path):
+    try:
+        if lock_path.exists():
+            data = json.loads(lock_path.read_text(encoding="utf-8"))
+            if _to_int(data.get("pid"), 0) == os.getpid():
+                lock_path.unlink()
+    except Exception:
+        pass
+
 
 def main():
     parser = argparse.ArgumentParser(description="Moltbook data scraper v2")
     parser.add_argument("--check", action="store_true", help="run data health check only")
+    parser.add_argument("--check-fast", action="store_true",
+                        help="fast check mode: skip strict per-post comment audit and reuse cached comment metrics")
+    parser.add_argument(
+        "--check-sample-posts",
+        type=int,
+        default=0,
+        help="when used with --check-fast, run strict audit on a random sample of eligible posts (0=disabled)",
+    )
     parser.add_argument("--full", action="store_true", help="full mode: ignore checkpoint and crawl history")
     parser.add_argument("--no-resume", action="store_true",
                         help="ignore and clear saved resume cursors")
@@ -1502,7 +2733,7 @@ def main():
     parser.add_argument("--no-comments", action="store_true", help="skip comments stage")
     parser.add_argument("--max-posts", type=int, default=None, help="max newly written posts this run")
     parser.add_argument("--reset", action="store_true", help="reset checkpoint and start fresh")
-    parser.add_argument("--workers", type=int, default=5, help="comment worker threads")
+    parser.add_argument("--workers", type=int, default=1, help="comment worker threads")
     parser.add_argument("--read-rpm", type=int, default=_DEFAULT_READ_RPM,
                         help=f"target read rate req/min (default {_DEFAULT_READ_RPM})")
     parser.add_argument("--comment-rpm", type=int, default=_DEFAULT_COMMENT_RPM,
@@ -1511,24 +2742,62 @@ def main():
                         help="only fetch comments for posts with comment_count >= N")
     parser.add_argument("--max-comment-posts", type=int, default=0,
                         help="max posts to fetch comments for (0 = unlimited)")
+    parser.add_argument(
+        "--comment-id-cache",
+        choices=("memory", "sqlite"),
+        default=_DEFAULT_COMMENT_ID_CACHE_MODE,
+        help="comment id dedup cache backend (memory or sqlite)",
+    )
+    parser.add_argument(
+        "--comment-queue-strategy",
+        choices=("layered", "small-first", "large-first"),
+        default=_DEFAULT_COMMENT_QUEUE_STRATEGY,
+        help=(
+            "comment scheduling strategy: layered (small->medium->long), "
+            "small-first, or large-first (legacy)"
+        ),
+    )
+    parser.add_argument(
+        "--queue-small-max",
+        type=int,
+        default=_DEFAULT_QUEUE_SMALL_MAX,
+        help=f"layered queue cutoff for small posts (default {_DEFAULT_QUEUE_SMALL_MAX})",
+    )
+    parser.add_argument(
+        "--queue-medium-max",
+        type=int,
+        default=_DEFAULT_QUEUE_MEDIUM_MAX,
+        help=f"layered queue cutoff for medium posts (default {_DEFAULT_QUEUE_MEDIUM_MAX})",
+    )
     parser.add_argument("--output-dir", default="data", help="output directory")
     parser.add_argument("--api-key", default="", help="override MOLTBOOK_API_KEY")
     parser.add_argument("--clean-runs", nargs="?", const=0, type=int, metavar="KEEP",
                         help="clean data/runs snapshots, optionally keep latest N")
     parser.add_argument("--dedup-comments", action="store_true", help="deduplicate comments_all.jsonl by id")
     parser.add_argument("--refetch-comments", type=int, metavar="N",
-                        help="remove done-cache marks for posts with comment_count >= N")
+                        help="force retry comments for posts with comment_count >= N (reset done/resume/cooldown state)")
     parser.add_argument("--snapshot", action="store_true", help="collect one hot/rising/top snapshot")
     parser.add_argument("--no-snapshot", action="store_true", help="disable end-of-run auto snapshot")
     parser.add_argument("--seed-snapshots", action="store_true", help="seed snapshots from posts_all.jsonl")
+    parser.add_argument("--agent-snapshot", action="store_true",
+                        help="save agent metrics snapshot (karma, followers, etc.) for time-series analysis")
+    parser.add_argument("--no-agent-snapshot", action="store_true",
+                        help="disable auto agent snapshot at end of run")
     args = parser.parse_args()
+    if args.check_fast:
+        # --check-fast alone must mean "fast check", not "unlocked full scrape".
+        args.check = True
 
-    # 鍛戒护琛?--api-key 浼樺厛绾ф渶楂橈紝瑕嗙洊 .env
+    # ?--api-key .env
     if args.api_key:
         HEADERS["Authorization"] = f"Bearer {args.api_key}"
 
     if args.read_rpm <= 0 or args.comment_rpm <= 0:
         raise SystemExit("--read-rpm and --comment-rpm must be >= 1")
+    if args.queue_small_max <= 0 or args.queue_medium_max <= 0:
+        raise SystemExit("--queue-small-max and --queue-medium-max must be >= 1")
+    if args.comment_queue_strategy == "layered" and args.queue_small_max >= args.queue_medium_max:
+        raise SystemExit("--queue-small-max must be < --queue-medium-max")
     if args.comments_only and args.no_comments:
         raise SystemExit("--comments-only conflicts with --no-comments")
     _rate_limiter.set_rate(args.read_rpm)
@@ -1538,8 +2807,19 @@ def main():
     out.mkdir(exist_ok=True)
     (out / "runs").mkdir(exist_ok=True)
 
+    # --check is read-only and may run alongside a live scrape; everything
+    # else mutates shared files and must hold the cross-process lock.
+    if not (args.check or args.check_fast):
+        if not acquire_scraper_lock(out / "scraper.lock"):
+            sys.exit(3)
+
     if args.check:
-        check_data(out)
+        check_data(
+            out,
+            min_comments=args.min_comments,
+            fast=args.check_fast,
+            sample_posts=max(0, args.check_sample_posts),
+        )
         return
 
     if args.clean_runs is not None:
@@ -1558,6 +2838,10 @@ def main():
         fetch_hot_snapshot(out)
         return
 
+    if args.agent_snapshot:
+        take_agent_snapshot(out)
+        return
+
     if args.seed_snapshots:
         seed_snapshots(out)
         return
@@ -1566,28 +2850,31 @@ def main():
     checkpoint = Checkpoint(checkpoint_path)
 
     if args.reset:
-        print("閲嶇疆 checkpoint...")
+        print("resetting checkpoint...")
         checkpoint_path.unlink(missing_ok=True)
         checkpoint = Checkpoint(checkpoint_path)
         args.full = True
 
     comments_resume_path = out / "comments_resume_cursor.jsonl"
+    comments_sync_state_path = out / "comments_post_sync_state.jsonl"
     if args.no_resume:
         had_post_resume = bool(checkpoint.data.get("_resume_cursor"))
         had_comment_resume = comments_resume_path.exists() and comments_resume_path.stat().st_size > 0
+        had_sync_state = comments_sync_state_path.exists() and comments_sync_state_path.stat().st_size > 0
         checkpoint.clear_resume()
         comments_resume_path.unlink(missing_ok=True)
-        if had_post_resume or had_comment_resume:
-            print("  [no-resume] cleared post/comment resume cursors; re-evaluating gaps from local data.")
+        comments_sync_state_path.unlink(missing_ok=True)
+        if had_post_resume or had_comment_resume or had_sync_state:
+            print("  [no-resume] cleared post/comment resume and sync-state cursors; re-evaluating gaps.")
         else:
-            print("  [no-resume] no saved cursors found; re-evaluating gaps from local data.")
+            print("  [no-resume] no saved cursors found; re-evaluating gaps.")
 
-    since_time = None if args.full else checkpoint.get_last_newest_time()
+    since_time = None
 
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # 鈹€鈹€ 鏈湴鏁版嵁锛堜粠 checkpoint 蹇€熻鍙栵紝鏃犻渶鎵弿澶ф枃浠讹級鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-    posts_store   = JsonlStore(out / "posts_all.jsonl")   # 鍙姞杞戒竴娆?
+    # checkpoint
+    posts_store   = JsonlStore(out / "posts_all.jsonl")   # ?
     comments_path = out / "comments_all.jsonl"
 
     local_oldest = local_newest = local_oldest_dt = ""
@@ -1599,7 +2886,7 @@ def main():
     if cp_newest:
         local_newest = cp_newest[:10]
 
-    # fallback锛歝heckpoint 鏃犺褰曟椂閲囨牱鏂囦欢澶村熬锛堥娆¤繍琛岋級
+    # fallback/checkpoint calibration
     posts_path = out / "posts_all.jsonl"
     if (not local_oldest or not local_newest) and posts_path.exists() and posts_path.stat().st_size > 0:
         head_dates, tail_dates = [], []
@@ -1631,16 +2918,63 @@ def main():
                 local_oldest_dt = min(all_dates)
                 local_oldest = local_oldest_dt[:10]
 
-    # 璇勮杩涘害缂撳瓨锛堝揩閫熻灏忔枃浠讹紝涓嶈Е鍙戣縼绉伙級
+    # Always sample tail to detect stale checkpoint newest anchor.
+    sampled_newest = ""
+    if posts_path.exists() and posts_path.stat().st_size > 0:
+        tail_dates = []
+        with open(posts_path, "rb") as fb:
+            fb.seek(max(0, posts_path.stat().st_size - 5_000_000))
+            tail_raw = fb.read().decode("utf-8", errors="replace")
+        for line in tail_raw.splitlines():
+            try:
+                d = json.loads(line.strip()).get("created_at", "")
+                if d:
+                    tail_dates.append(d)
+            except Exception:
+                pass
+        if tail_dates:
+            sampled_newest = max(tail_dates)
+            if not local_newest or sampled_newest[:10] > local_newest:
+                local_newest = sampled_newest[:10]
+            cp_newest = checkpoint.data.get("newest_post_created_at") or ""
+            if checkpoint.data.get("_resume_cursor"):
+                # An interrupted incremental window is pending. The file tail
+                # holds posts NEWER than the unfetched window (we page newest
+                # first), so fast-forwarding the anchor here would orphan the
+                # window and silently lose it. Let the resume finish instead.
+                if cp_newest and sampled_newest > cp_newest:
+                    print(
+                        f"  [anchor fix] skipped: pending resume cursor for an unfinished "
+                        f"window (anchor {cp_newest[:19]}, tail {sampled_newest[:19]})."
+                    )
+            elif cp_newest and sampled_newest > cp_newest:
+                print(
+                    f"  [anchor fix] checkpoint newest {cp_newest[:19]} is older than local posts "
+                    f"tail {sampled_newest[:19]}; fast-forward incremental anchor."
+                )
+                checkpoint.data["newest_post_created_at"] = sampled_newest
+                checkpoint.save()
+
+    since_time = None if args.full else checkpoint.get_last_newest_time()
+
+    #
     done_cache_path = out / "comments_done_posts.txt"
     done_posts_count = 0
     if done_cache_path.exists():
         with open(done_cache_path, encoding="utf-8") as _f:
             done_posts_count = sum(1 for line in _f if line.strip())
-    total_eligible_cached = checkpoint.data.get("total_eligible_comment_posts", 0)
+    eligible_map = checkpoint.data.get("total_eligible_comment_posts_by_min", {})
+    if not isinstance(eligible_map, dict):
+        eligible_map = {}
+    legacy_total_eligible = _to_int(checkpoint.data.get("total_eligible_comment_posts", 0), 0)
+    if legacy_total_eligible > 0 and legacy_total_eligible >= max(1, done_posts_count // 2) and "30" not in eligible_map:
+        eligible_map["30"] = legacy_total_eligible
+        checkpoint.data["total_eligible_comment_posts_by_min"] = eligible_map
+        checkpoint.save()
+    total_eligible_cached = _to_int(eligible_map.get(str(args.min_comments), 0), 0)
 
-    # 鈹€鈹€ 骞冲彴鏁版嵁锛圓PI锛夆攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-    print("姝ｅ湪鑾峰彇骞冲彴鏁版嵁...")
+    # PI
+    print("fetching platform stats...")
     stats = fetch_platform_stats()
     submolts = fetch_submolts()
     platform_total    = int(stats.get("totalPosts",    0) or 0)
@@ -1648,7 +2982,7 @@ def main():
     platform_comments = int(stats.get("totalComments", 0) or 0)
     platform_submolts = int(stats.get("totalSubmolts", 0) or 0)
 
-    # 鈹€鈹€ 鍚姩鎽樿锛堢姸鎬?+ 璁″垝锛夆攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ?+
     show_startup_summary(
         checkpoint, posts_store.count(), local_oldest, local_newest,
         done_posts_count, total_eligible_cached,
@@ -1658,83 +2992,107 @@ def main():
 
     t_start = time.time()
 
-    # 鍏ㄩ噺妯″紡璺宠繃宸茬煡鍖哄煙
+    #
     if args.full and not args.no_resume:
         rc, _, _ = checkpoint.get_resume_cursor()
         if not rc:
             bc_cursor, bc_date = checkpoint.get_bottom_cursor()
             if bc_cursor and bc_date and local_oldest_dt and bc_date >= local_oldest_dt:
-                print(f"  [鑷姩璺宠繃] 鍙戠幇瀛樻。鐐?({bc_date[:10]})锛岃烦杩囧凡鎶撳尯鍩熺洿鎺ョ画鎶撳巻鍙茬己鍙?..")
+                print(
+                    f"  [auto-skip] bottom cursor found ({bc_date[:10]}), skip already-covered zone and continue older gaps..."
+                )
                 checkpoint.data["_resume_cursor"] = bc_cursor
                 checkpoint.data["_resume_since"] = None
                 checkpoint.save()
 
-    # 鈹€鈹€ 1. 甯栧瓙 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 1.
     run_posts_path = out / "runs" / f"{run_ts}_posts.jsonl"
     new_post_count = 0
     stopped_early = False
     newest_post = None
     api_error = False
     reached_end = False
+    keep_cursor = False
     if args.comments_only:
-        print("[1/3] 跳过帖子阶段（--comments-only）...")
+        print("[1/3] skip posts stage (--comments-only)...")
         run_posts_path.touch()
     else:
-        print("[1/3] 抓取帖子...")
+        print("[1/3] fetch posts...")
         with open(run_posts_path, "w", encoding="utf-8") as run_posts_f:
-            new_post_count, stopped_early, newest_post, api_error, reached_end = fetch_posts_incremental(
+            new_post_count, stopped_early, newest_post, api_error, reached_end, keep_cursor = fetch_posts_incremental(
                 checkpoint, posts_store, run_posts_f,
                 since_time=since_time, max_posts=args.max_posts,
                 platform_total=platform_total
             )
 
         if since_time and new_post_count == 0:
-            print(f"  没有新帖子（上次运行后暂无更新）。")
-            checkpoint.clear_resume()
+            print("  no new posts since last run.")
+            if not api_error:
+                checkpoint.clear_resume()
             if args.no_comments:
+                if _FATAL_AUTH_EVENT.is_set():
+                    print("  [!] FATAL: 401/403 auth failures during this run; exiting non-zero.")
+                    sys.exit(2)
                 return
-            # 否则继续跑评论阶段（历史评论还没抓完）
+            #
         if stopped_early:
-            print(f"  遇到旧帖子，增量结束。新写入 {new_post_count} 条  |  累积: {posts_store.count()} 条")
+            print(f"  reached older posts; incremental stop. new written: {new_post_count}  |  total: {posts_store.count()}")
         else:
-            print(f"  新写入 {new_post_count} 条  |  累积: {posts_store.count()} 条")
+            print(f"  new written: {new_post_count}  |  total: {posts_store.count()}")
 
-    # 鈹€鈹€ 2. 璇勮 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 2.
     new_comment_count = 0
-    if not args.no_comments:
-        print(f"\n[2/3] 鎶撳彇璇勮锛坈omment_count >= {args.min_comments}锛?..")
+    if not args.no_comments and _FATAL_AUTH_EVENT.is_set():
+        print("\n[2/3] skip comments: fatal auth failure in posts stage (saves the eligible scan + seed).")
+    elif not args.no_comments:
+        print(f"\n[2/3] fetch comments (comment_count >= {args.min_comments})...")
 
-        # 鍒濆鍖栬瘎璁鸿繘搴︾紦瀛橈紙棣栨杩愯鑷姩浠?comments_all.jsonl 杩佺Щ锛屼箣鍚庣寮€锛?
+        # ?comments_all.jsonl ?
         done_cache = CommentsDoneCache(
             done_cache_path,
             comments_jsonl=comments_path if comments_path.exists() else None
         )
         resume_cache = CommentsResumeCache(comments_resume_path)
+        sync_state = CommentsPostSyncState(comments_sync_state_path)
 
         run_comments_path = out / "runs" / f"{run_ts}_comments.jsonl"
+        comments_id_cache_sqlite = out / "comments_id_cache.sqlite"
         with open(run_comments_path, "w", encoding="utf-8") as run_comments_f:
             new_comment_count, total_eligible = fetch_comments_for_posts(
                 posts_store, comments_path, done_cache, run_comments_f,
                 workers=args.workers, min_comments=args.min_comments,
                 max_posts=args.max_comment_posts,
-                resume_cache=resume_cache
+                resume_cache=resume_cache,
+                sync_state=sync_state,
+                comment_id_cache_mode=args.comment_id_cache,
+                comment_id_cache_path=comments_id_cache_sqlite,
+                queue_strategy=args.comment_queue_strategy,
+                queue_small_max=args.queue_small_max,
+                queue_medium_max=args.queue_medium_max,
             )
         print(f"  new comments written: {new_comment_count}")
 
-        # 淇濆瓨 total_eligible 渚涗笅娆″惎鍔ㄦ憳瑕佷娇鐢?
+        # total_eligible ?
         if total_eligible:
-            checkpoint.data["total_eligible_comment_posts"] = total_eligible
+            emap = checkpoint.data.get("total_eligible_comment_posts_by_min", {})
+            if not isinstance(emap, dict):
+                emap = {}
+            emap[str(args.min_comments)] = int(total_eligible)
+            checkpoint.data["total_eligible_comment_posts_by_min"] = emap
+            # Keep legacy key for backward compatibility (default threshold use-case).
+            if args.min_comments == 30:
+                checkpoint.data["total_eligible_comment_posts"] = int(total_eligible)
             checkpoint.save()
     else:
         print("\n[2/3] skip comments.")
 
-    # 鈹€鈹€ 3. 绀惧尯鍒楄〃 + Agent 妗ｆ 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-    print(f"\n[3/3] 淇濆瓨绀惧尯鍒楄〃 & 鎻愬彇 agent 妗ｆ...")
+    # 3. + Agent
+    print("\n[3/3] save submolts list and extract agent profiles...")
 
     if submolts:
         with open(out / "submolts.json", "w", encoding="utf-8") as f:
             json.dump(submolts, f, ensure_ascii=False, indent=2)
-        print(f"  绀惧尯鍒楄〃: {len(submolts)} 涓?鈫?data/submolts.json")
+        print(f"  submolts list: {len(submolts)} -> data/submolts.json")
 
     agents_store = JsonlStore(out / "agents_seen.jsonl")
     this_run_agents = {}
@@ -1753,29 +3111,44 @@ def main():
     new_agent_count = agents_store.append_new(list(this_run_agents.values()))
     print(f"  agent profiles: +{new_agent_count} | total: {agents_store.count()}")
 
-    # 鈹€鈹€ 瀹屾垚 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # Agent snapshot (time series)
+    if not args.no_agent_snapshot:
+        take_agent_snapshot(out)
+
+    #
     duration = time.time() - t_start
     checkpoint.update_after_run(
         new_posts=new_post_count,
         new_comments=new_comment_count,
         duration_s=duration,
         newest_post=newest_post,
-        clear_cursor=not api_error,
+        # Never touch posts resume state when the posts stage did not run
+        # (--comments-only) or did not finish its window (api_error /
+        # keep_cursor from truncation or the zero-streak guard).
+        clear_cursor=(not api_error) and (not keep_cursor) and (not args.comments_only),
         reached_end=reached_end,
+        advance_anchor=(stopped_early or reached_end) and not api_error,
     )
     if api_error:
         print("  [!] API error mid-run: cursor kept; next --full can resume.")
+    if _FATAL_AUTH_EVENT.is_set():
+        runs = checkpoint.data.get("runs") or []
+        if runs:
+            runs[-1]["auth_failed"] = True
+            checkpoint.save()
+        print("  [!] FATAL: 401/403 auth failures during this run; exiting non-zero so the scheduler can alert.")
+        sys.exit(2)
 
     total_now = posts_store.count()
     pct_now = f"{total_now / platform_total * 100:.2f}%" if platform_total else "?"
-    print(f"\n=== 瀹屾垚锛佽€楁椂 {duration:.0f}s ===")
-    print(f"  绱Н甯栧瓙: {total_now:,} / {platform_total:,}  ({pct_now})")
+    print(f"\n=== done! elapsed {duration:.0f}s ===")
+    print(f"  cumulative posts: {total_now:,} / {platform_total:,} ({pct_now})")
     print(f"  runs: {len(checkpoint.data['runs'])}")
-    print(f"  鏁版嵁鐩綍: {out}/")
+    print(f"  data dir: {out}/")
 
-    # 鑷姩鐑棬蹇収锛堟瘡娆?run 缁撴潫鏃舵墦涓€娆★紝闄ら潪 --no-snapshot锛?
+    # ?run --no-snapshot?
     if not args.no_snapshot:
-        print("\n[4/4] 鐑棬蹇収...")
+        print("\n[4/4] fetch hot snapshot...")
         fetch_hot_snapshot(out)
 
 

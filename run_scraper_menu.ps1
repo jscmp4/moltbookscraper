@@ -3,14 +3,9 @@ $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $PSScriptRoot
 
 function Get-Runner {
-    $conda = Get-Command conda -ErrorAction SilentlyContinue
-    if ($conda) {
-        return @{
-            Kind = "conda"
-            Cmd  = "conda"
-            Base = @("run", "--no-capture-output", "-n", "base", "python", "-X", "utf8", "scraper.py")
-        }
-    }
+    # Always use PATH python so menu, scheduled task, and manual runs share
+    # ONE interpreter (the conda base env has a broken numpy/matplotlib pair
+    # and was dropped from run_scraper_auto.bat on 2026-06-09).
     return @{
         Kind = "python"
         Cmd  = "python"
@@ -70,12 +65,117 @@ function Ask-YesNo {
     }
 }
 
+function Ask-QueueStrategy {
+    param(
+        [string]$Default = "layered"
+    )
+    $valid = @("layered", "small-first", "large-first")
+    while ($true) {
+        $raw = Read-Host "comment-queue-strategy [layered/small-first/large-first] [$Default]"
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return $Default
+        }
+        $v = $raw.Trim().ToLowerInvariant()
+        if ($valid -contains $v) {
+            return $v
+        }
+        Write-Host "Please input one of: layered, small-first, large-first" -ForegroundColor Yellow
+    }
+}
+
+function Ask-CommentIdCache {
+    param(
+        [string]$Default = "memory"
+    )
+    $valid = @("memory", "sqlite")
+    while ($true) {
+        $raw = Read-Host "comment-id-cache [memory/sqlite] [$Default]"
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return $Default
+        }
+        $v = $raw.Trim().ToLowerInvariant()
+        if ($valid -contains $v) {
+            return $v
+        }
+        Write-Host "Please input one of: memory, sqlite" -ForegroundColor Yellow
+    }
+}
+
+function Ask-MinCommentsPreset {
+    param(
+        [int]$Default = 30
+    )
+    while ($true) {
+        Write-Host ""
+        Write-Host "min-comments preset (fetch comments where comment_count >= N):" -ForegroundColor DarkGray
+        Write-Host "  [1] 30 (recommended, fastest)"
+        Write-Host "  [2] 25 (broader)"
+        Write-Host "  [3] 20 (broader)"
+        Write-Host "  [4] 15 (broadest preset)"
+        Write-Host "  [5] custom N"
+        $defaultPick = switch ($Default) {
+            30 { "1" }
+            25 { "2" }
+            20 { "3" }
+            15 { "4" }
+            default { "5" }
+        }
+        $raw = Read-Host "pick 1-5, or input integer directly [$defaultPick]"
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            $raw = $defaultPick
+        }
+        $txt = $raw.Trim().ToLowerInvariant()
+        $n = 0
+        if ([int]::TryParse($txt, [ref]$n)) {
+            switch ($n) {
+                1 { return 30 }
+                2 { return 25 }
+                3 { return 20 }
+                4 { return 15 }
+                5 { return (Ask-Int "custom min-comments N" $Default 0) }
+                default {
+                    if ($n -ge 0) { return $n }
+                }
+            }
+        }
+        switch ($txt) {
+            "recommended" { return 30 }
+            "fast" { return 30 }
+            "broad" { return 20 }
+            "custom" { return (Ask-Int "custom min-comments N" $Default 0) }
+        }
+        Write-Host "Please input 1-5 or an integer >= 0" -ForegroundColor Yellow
+    }
+}
+
+function Run-IncrementalPreset {
+    $minComments = Ask-MinCommentsPreset 3
+    $workers = Ask-Int "workers" 1 1
+    $commentRpm = Ask-Int "comment-rpm" 100 1
+    Invoke-Scraper -ArgsList @(
+        "--workers", "$workers",
+        "--comment-rpm", "$commentRpm",
+        "--min-comments", "$minComments",
+        "--comment-queue-strategy", "layered",
+        "--comment-id-cache", "sqlite",
+        "--no-snapshot"
+    )
+}
+
 function Run-Custom {
     $workers = Ask-Int "workers" 1 1
-    $readRpm = Ask-Int "read-rpm" 40 1
-    $commentRpm = Ask-Int "comment-rpm" 38 1
-    $minComments = Ask-Int "min-comments" 30 0
+    $readRpm = Ask-Int "read-rpm" 100 1
+    $commentRpm = Ask-Int "comment-rpm" 100 1
+    $minComments = Ask-Int "min-comments" 3 0
     $maxCommentPosts = Ask-Int "max-comment-posts (0 = unlimited)" 0 0
+    $queueStrategy = Ask-QueueStrategy "layered"
+    $commentIdCache = Ask-CommentIdCache "sqlite"
+    $queueSmallMax = 80
+    $queueMediumMax = 400
+    if ($queueStrategy -eq "layered") {
+        $queueSmallMax = Ask-Int "queue-small-max (small <= N)" 80 1
+        $queueMediumMax = Ask-Int "queue-medium-max (medium <= N, must > small)" 400 ($queueSmallMax + 1)
+    }
     $useNoSnapshot = Ask-YesNo "disable auto snapshot (--no-snapshot)" $true
     $useFull = Ask-YesNo "run full mode (--full)" $false
     $useCommentsOnly = Ask-YesNo "comments-only mode (--comments-only)" $false
@@ -87,9 +187,12 @@ function Run-Custom {
         return
     }
 
-    $args = @("--workers", "$workers", "--read-rpm", "$readRpm", "--comment-rpm", "$commentRpm", "--min-comments", "$minComments")
+    $args = @("--workers", "$workers", "--read-rpm", "$readRpm", "--comment-rpm", "$commentRpm", "--min-comments", "$minComments", "--comment-queue-strategy", "$queueStrategy", "--comment-id-cache", "$commentIdCache")
     if ($maxCommentPosts -gt 0) {
         $args += @("--max-comment-posts", "$maxCommentPosts")
+    }
+    if ($queueStrategy -eq "layered") {
+        $args += @("--queue-small-max", "$queueSmallMax", "--queue-medium-max", "$queueMediumMax")
     }
     if ($useNoSnapshot) { $args += "--no-snapshot" }
     if ($useFull) { $args += "--full" }
@@ -101,15 +204,26 @@ function Run-Custom {
 }
 
 function Run-CommentsGapBackfill {
-    $minComments = Ask-Int "min-comments threshold (comment_count >= N)" 30 0
+    $minComments = Ask-MinCommentsPreset 3
     $maxCommentPosts = Ask-Int "max-comment-posts this run (0 = unlimited)" 0 0
     $workers = Ask-Int "workers" 1 1
-    $commentRpm = Ask-Int "comment-rpm" 38 1
-    $useNoResume = Ask-YesNo "ignore saved resume cursor (--no-resume)" $true
+    $commentRpm = Ask-Int "comment-rpm" 100 1
+    $queueStrategy = Ask-QueueStrategy "layered"
+    $commentIdCache = Ask-CommentIdCache "sqlite"
+    $queueSmallMax = 80
+    $queueMediumMax = 400
+    if ($queueStrategy -eq "layered") {
+        $queueSmallMax = Ask-Int "queue-small-max (small <= N)" 80 1
+        $queueMediumMax = Ask-Int "queue-medium-max (medium <= N, must > small)" 400 ($queueSmallMax + 1)
+    }
+    $useNoResume = Ask-YesNo "ignore saved resume cursor (--no-resume, usually NO for layered reruns)" $false
 
-    $args = @("--workers", "$workers", "--comment-rpm", "$commentRpm", "--min-comments", "$minComments", "--comments-only", "--no-snapshot")
+    $args = @("--workers", "$workers", "--comment-rpm", "$commentRpm", "--min-comments", "$minComments", "--comments-only", "--no-snapshot", "--comment-queue-strategy", "$queueStrategy", "--comment-id-cache", "$commentIdCache")
     if ($maxCommentPosts -gt 0) {
         $args += @("--max-comment-posts", "$maxCommentPosts")
+    }
+    if ($queueStrategy -eq "layered") {
+        $args += @("--queue-small-max", "$queueSmallMax", "--queue-medium-max", "$queueMediumMax")
     }
     if ($useNoResume) { $args += "--no-resume" }
 
@@ -243,8 +357,8 @@ function Select-MenuItem {
 $menu = @(
     @{
         Name = "Incremental (recommended)"
-        Desc = "posts incremental + comments gap-backfill (>=30), 1 worker, no snapshot"
-        Run  = { Invoke-Scraper -ArgsList @("--workers", "1", "--min-comments", "30", "--no-snapshot") }
+        Desc = "posts incremental + comments gap-backfill (threshold preset: 30/25/20/15/custom)"
+        Run  = { Run-IncrementalPreset }
     },
     @{
         Name = "Only Posts Incremental"
@@ -253,13 +367,25 @@ $menu = @(
     },
     @{
         Name = "Comments Gap Backfill"
-        Desc = "comments-only gap-backfill (skip posts); optional --no-resume"
+        Desc = "comments-only gap-backfill (threshold preset: 30/25/20/15/custom)"
         Run  = { Run-CommentsGapBackfill }
     },
     @{
         Name = "Data Check"
-        Desc = "run built-in data health check"
-        Run  = { Invoke-Scraper -ArgsList @("--check") }
+        Desc = "run data health check with configurable eligible threshold"
+        Run  = {
+            $minComments = Ask-Int "check min-comments threshold (comment_count >= N)" 30 0
+            $fastCheck = Ask-YesNo "fast check mode (skip strict comment audit, use cached comment metrics)" $false
+            $args = @("--check", "--min-comments", "$minComments")
+            if ($fastCheck) {
+                $args += "--check-fast"
+                $samplePosts = Ask-Int "fast check sample-posts for strict audit (0 = disable)" 300 0
+                if ($samplePosts -gt 0) {
+                    $args += @("--check-sample-posts", "$samplePosts")
+                }
+            }
+            Invoke-Scraper -ArgsList $args
+        }
     },
     @{
         Name = "Dedup Comments"
@@ -268,7 +394,7 @@ $menu = @(
     },
     @{
         Name = "Refetch High-Comment Posts"
-        Desc = "remove done-cache marks for posts with comment_count >= N"
+        Desc = "force retry comments for posts >= N (reset done/resume/cooldown state)"
         Run  = {
             $n = Ask-Int "refetch threshold N (comment_count >= N)" 30 1
             Invoke-Scraper -ArgsList @("--refetch-comments", "$n")
@@ -280,11 +406,25 @@ $menu = @(
         Run  = { Invoke-Scraper -ArgsList @("--snapshot") }
     },
     @{
+        Name = "Agent Snapshot"
+        Desc = "save agent metrics snapshot (karma, followers) for time-series analysis"
+        Run  = { Invoke-Scraper -ArgsList @("--agent-snapshot") }
+    },
+    @{
         Name = "Clean runs/"
         Desc = "delete run snapshots; choose keep-last count"
         Run  = {
             $keep = Ask-Int "keep last N run files (0 = delete all)" 5 0
             Invoke-Scraper -ArgsList @("--clean-runs", "$keep")
+        }
+    },
+    @{
+        Name = "Daily Report"
+        Desc = "show growth trends, predictions, and scraping status"
+        Run  = {
+            $runner = Get-Runner
+            $cmd = @($runner.Base[0..($runner.Base.Length-2)] + @("daily_report.py"))
+            & $runner.Cmd @cmd
         }
     },
     @{

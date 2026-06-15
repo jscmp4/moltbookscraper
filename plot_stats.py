@@ -1,48 +1,53 @@
 # -*- coding: utf-8 -*-
 """
-Moltbook 数据可视化
-用法: python -X utf8 plot_stats.py
-生成: data/plots/ 目录下的 PNG 图表
+Generate basic analytics plots from local Moltbook JSONL data.
+
+Usage:
+    python -X utf8 plot_stats.py
+Output:
+    data/plots/*.png
 """
 
+import datetime
 import json
 from collections import defaultdict
 from datetime import date as date_type, timedelta
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import matplotlib.ticker as mticker
-from matplotlib.patches import Patch
-import datetime
 
-DATA_DIR  = Path("data")
+matplotlib.use("Agg")
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+
+DATA_DIR = Path("data")
 PLOTS_DIR = DATA_DIR / "plots"
 PLOTS_DIR.mkdir(exist_ok=True)
 
-POSTS_FILE    = DATA_DIR / "posts_all.jsonl"
+POSTS_FILE = DATA_DIR / "posts_all.jsonl"
 COMMENTS_FILE = DATA_DIR / "comments_all.jsonl"
 
-# ── 配色 ────────────────────────────────────────
+# Colors
 C_NORMAL = "#4C9BE8"
-C_SPAM   = "#E8694C"
-C_EVENT1 = "#E8C34C"   # mbc-20 wave start
-C_EVENT2 = "#6FBF73"   # platform intervention
+C_SPAM = "#E8694C"
+C_EVENT1 = "#E8C34C"  # mbc-20 wave start
+C_EVENT2 = "#6FBF73"  # anti-spam intervention
 
-plt.rcParams.update({
-    "font.family": "sans-serif",
-    "axes.spines.top":   False,
-    "axes.spines.right": False,
-    "figure.dpi": 150,
-})
+plt.rcParams.update(
+    {
+        "font.family": "sans-serif",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "figure.dpi": 150,
+    }
+)
 
 
 def load_daily_posts(path: Path):
-    """返回 {date_str: {"normal": n, "spam": n}} """
+    """Return {date_str: {'normal': n, 'spam': n}}."""
     daily = defaultdict(lambda: {"normal": 0, "spam": 0})
-    print("扫描帖子...", end="", flush=True)
+    print("scanning posts...", end="", flush=True)
     with open(path, encoding="utf-8") as f:
         for i, line in enumerate(f):
             line = line.strip()
@@ -60,17 +65,17 @@ def load_daily_posts(path: Path):
             except Exception:
                 pass
             if (i + 1) % 500_000 == 0:
-                print(f" {i+1//1000}k", end="", flush=True)
+                print(f" {(i + 1) // 1000}k", end="", flush=True)
     print(" done")
     return daily
 
 
 def load_daily_comments(path: Path):
-    """返回 {date_str: count}"""
+    """Return {date_str: count}."""
     daily = defaultdict(int)
     if not path.exists():
         return daily
-    print("扫描评论...", end="", flush=True)
+    print("scanning comments...", end="", flush=True)
     with open(path, encoding="utf-8") as f:
         for i, line in enumerate(f):
             line = line.strip()
@@ -84,7 +89,7 @@ def load_daily_comments(path: Path):
             except Exception:
                 pass
             if (i + 1) % 1_000_000 == 0:
-                print(f" {(i+1)//1000}k", end="", flush=True)
+                print(f" {(i + 1) // 1000}k", end="", flush=True)
     print(" done")
     return daily
 
@@ -102,34 +107,43 @@ def date_range(daily: dict):
     return result
 
 
+def _kfmt(v, _):
+    return f"{v / 1000:.0f}k" if v >= 1000 else str(int(v))
+
+
 def plot_daily_posts(daily: dict, out: Path):
     dates = date_range(daily)
     xs = [datetime.date.fromisoformat(d) for d in dates]
     normal = [daily[d]["normal"] for d in dates]
-    spam   = [daily[d]["spam"]   for d in dates]
+    spam = [daily[d]["spam"] for d in dates]
 
     fig, ax = plt.subplots(figsize=(14, 5))
-    ax.bar(xs, normal, label="Normal posts",   color=C_NORMAL, width=0.85)
-    ax.bar(xs, spam,   label="Spam (mbc-20)",  color=C_SPAM,   width=0.85, bottom=normal)
+    ax.bar(xs, normal, label="Normal posts", color=C_NORMAL, width=0.85)
+    ax.bar(xs, spam, label="Spam (mbc-20)", color=C_SPAM, width=0.85, bottom=normal)
 
-    # 标注事件
-    ax.axvline(datetime.date(2026, 2, 6),  color=C_EVENT1, lw=1.5, ls="--", alpha=0.8)
+    # Event annotations
+    ax.axvline(datetime.date(2026, 2, 6), color=C_EVENT1, lw=1.5, ls="--", alpha=0.8)
     ax.axvline(datetime.date(2026, 2, 18), color=C_EVENT2, lw=1.5, ls="--", alpha=0.8)
-    ax.text(datetime.date(2026, 2, 6),  ax.get_ylim()[1] * 0.97, " mbc-20 wave start",
-            color=C_EVENT1, fontsize=8, va="top")
-    ax.text(datetime.date(2026, 2, 18), ax.get_ylim()[1] * 0.97, " anti-spam enforcement",
-            color=C_EVENT2, fontsize=8, va="top")
+    ax.text(datetime.date(2026, 2, 6), ax.get_ylim()[1] * 0.97, " mbc-20 wave start", color=C_EVENT1, fontsize=8, va="top")
+    ax.text(
+        datetime.date(2026, 2, 18),
+        ax.get_ylim()[1] * 0.97,
+        " anti-spam enforcement",
+        color=C_EVENT2,
+        fontsize=8,
+        va="top",
+    )
 
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
     ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=0))
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v/1000:.0f}k" if v >= 1000 else str(int(v))))
-    ax.set_title("Moltbook — Daily Post Volume", fontsize=14, fontweight="bold", pad=12)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(_kfmt))
+    ax.set_title("Moltbook - Daily Post Volume", fontsize=14, fontweight="bold", pad=12)
     ax.set_ylabel("Posts per day")
     ax.legend(loc="upper left")
     fig.tight_layout()
     fig.savefig(out)
     plt.close(fig)
-    print(f"  saved → {out}")
+    print(f"  saved -> {out}")
 
 
 def plot_daily_comments(daily: dict, out: Path):
@@ -143,19 +157,19 @@ def plot_daily_comments(daily: dict, out: Path):
 
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
     ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=0))
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v/1000:.0f}k" if v >= 1000 else str(int(v))))
-    ax.set_title("Moltbook — Daily Comments Collected", fontsize=14, fontweight="bold", pad=12)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(_kfmt))
+    ax.set_title("Moltbook - Daily Comments Collected", fontsize=14, fontweight="bold", pad=12)
     ax.set_ylabel("Comments per day")
     fig.tight_layout()
     fig.savefig(out)
     plt.close(fig)
-    print(f"  saved → {out}")
+    print(f"  saved -> {out}")
 
 
 def plot_posts_by_hour(path: Path, out: Path):
-    """全局每小时发帖分布（0-23）"""
+    """Plot overall post distribution by UTC hour (0-23), excluding spam."""
     hours = defaultdict(int)
-    print("扫描小时分布...", end="", flush=True)
+    print("scanning hourly distribution...", end="", flush=True)
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -178,33 +192,33 @@ def plot_posts_by_hour(path: Path, out: Path):
     ax.bar(xs, ys, color=C_NORMAL, width=0.7)
     ax.set_xticks(xs)
     ax.set_xticklabels([f"{h:02d}:00" for h in xs], rotation=45, ha="right", fontsize=8)
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v/1000:.0f}k" if v >= 1000 else str(int(v))))
-    ax.set_title("Moltbook — Post Volume by Hour (UTC, spam excluded)", fontsize=13, fontweight="bold", pad=12)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(_kfmt))
+    ax.set_title("Moltbook - Post Volume by Hour (UTC, spam excluded)", fontsize=13, fontweight="bold", pad=12)
     ax.set_ylabel("Total posts")
     fig.tight_layout()
     fig.savefig(out)
     plt.close(fig)
-    print(f"  saved → {out}")
+    print(f"  saved -> {out}")
 
 
 def main():
     if not POSTS_FILE.exists():
-        print(f"[!] {POSTS_FILE} 不存在")
+        print(f"[!] missing {POSTS_FILE}")
         return
 
-    print("\n=== Moltbook 数据可视化 ===\n")
+    print("\n=== Moltbook Plot Generation ===\n")
 
     daily_posts = load_daily_posts(POSTS_FILE)
     daily_comments = load_daily_comments(COMMENTS_FILE)
 
-    plot_daily_posts(daily_posts,       PLOTS_DIR / "daily_posts.png")
+    plot_daily_posts(daily_posts, PLOTS_DIR / "daily_posts.png")
     plot_daily_comments(daily_comments, PLOTS_DIR / "daily_comments.png")
-    plot_posts_by_hour(POSTS_FILE,      PLOTS_DIR / "posts_by_hour.png")
+    plot_posts_by_hour(POSTS_FILE, PLOTS_DIR / "posts_by_hour.png")
 
-    print(f"\n完成！图表保存在 {PLOTS_DIR}/")
-    print("  daily_posts.png    — 每日发帖量（normal vs spam）")
-    print("  daily_comments.png — 每日评论收集量")
-    print("  posts_by_hour.png  — 全天各小时发帖分布（UTC）")
+    print(f"\nDone. Plots saved to {PLOTS_DIR}/")
+    print("  daily_posts.png    - daily post volume (normal vs spam)")
+    print("  daily_comments.png - daily collected comments")
+    print("  posts_by_hour.png  - post volume by UTC hour")
 
 
 if __name__ == "__main__":
