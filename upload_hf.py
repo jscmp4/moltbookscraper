@@ -41,7 +41,7 @@ except Exception as e:
     sys.exit(1)
 
 # 2) Delete old split files
-print("\n[1/3] deleting obsolete files...")
+print("\n[1/4] deleting obsolete files...")
 for fname in FILES_TO_DELETE:
     try:
         api.delete_file(path_in_repo=fname, repo_id=REPO_ID, repo_type="dataset")
@@ -53,8 +53,8 @@ for fname in FILES_TO_DELETE:
         else:
             print(f"  [!] failed deleting {fname}: {e}")
 
-# 3) Upload files
-print("\n[2/3] uploading files...")
+# 3) Upload primary files
+print("\n[2/4] uploading primary files...")
 for local_name, remote_name in FILES_TO_UPLOAD:
     local_path = Path(local_name) if local_name == "README.md" else DATA_DIR / local_name
     if not local_path.exists():
@@ -76,5 +76,28 @@ for local_name, remote_name in FILES_TO_UPLOAD:
         print(f"  [!] upload failed for {remote_name}: {e}")
         raise
 
-print("\n[3/3] done")
+# 4) Upload agent snapshots folder (incremental: only new/changed files)
+snapshot_dir = DATA_DIR / "agent_snapshots"
+print(f"\n[3/4] uploading agent_snapshots/ ...")
+if snapshot_dir.is_dir():
+    snap_files = sorted(snapshot_dir.glob("*.jsonl"))
+    total_mb = sum(p.stat().st_size for p in snap_files) / 1024**2
+    print(f"  {len(snap_files)} snapshot files, {total_mb:.1f} MB total")
+    try:
+        api.upload_folder(
+            folder_path=str(snapshot_dir),
+            path_in_repo="agent_snapshots",
+            repo_id=REPO_ID,
+            repo_type="dataset",
+            commit_message=f"Update agent_snapshots ({len(snap_files)} files)",
+            allow_patterns=["*.jsonl"],
+        )
+        print(f"  [ok] uploaded agent_snapshots/")
+    except Exception as e:
+        print(f"  [!] upload failed for agent_snapshots/: {e}")
+        raise
+else:
+    print(f"  [!] {snapshot_dir} not found, skip")
+
+print("\n[4/4] done")
 print(f"  dataset: https://huggingface.co/datasets/{REPO_ID}")

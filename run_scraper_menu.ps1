@@ -3,14 +3,9 @@ $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $PSScriptRoot
 
 function Get-Runner {
-    $conda = Get-Command conda -ErrorAction SilentlyContinue
-    if ($conda) {
-        return @{
-            Kind = "conda"
-            Cmd  = "conda"
-            Base = @("run", "--no-capture-output", "-n", "base", "python", "-X", "utf8", "scraper.py")
-        }
-    }
+    # Always use PATH python so menu, scheduled task, and manual runs share
+    # ONE interpreter (the conda base env has a broken numpy/matplotlib pair
+    # and was dropped from run_scraper_auto.bat on 2026-06-09).
     return @{
         Kind = "python"
         Cmd  = "python"
@@ -154,9 +149,9 @@ function Ask-MinCommentsPreset {
 }
 
 function Run-IncrementalPreset {
-    $minComments = Ask-MinCommentsPreset 30
+    $minComments = Ask-MinCommentsPreset 3
     $workers = Ask-Int "workers" 1 1
-    $commentRpm = Ask-Int "comment-rpm" 38 1
+    $commentRpm = Ask-Int "comment-rpm" 100 1
     Invoke-Scraper -ArgsList @(
         "--workers", "$workers",
         "--comment-rpm", "$commentRpm",
@@ -169,12 +164,12 @@ function Run-IncrementalPreset {
 
 function Run-Custom {
     $workers = Ask-Int "workers" 1 1
-    $readRpm = Ask-Int "read-rpm" 40 1
-    $commentRpm = Ask-Int "comment-rpm" 38 1
-    $minComments = Ask-Int "min-comments" 30 0
+    $readRpm = Ask-Int "read-rpm" 100 1
+    $commentRpm = Ask-Int "comment-rpm" 100 1
+    $minComments = Ask-Int "min-comments" 3 0
     $maxCommentPosts = Ask-Int "max-comment-posts (0 = unlimited)" 0 0
     $queueStrategy = Ask-QueueStrategy "layered"
-    $commentIdCache = Ask-CommentIdCache "memory"
+    $commentIdCache = Ask-CommentIdCache "sqlite"
     $queueSmallMax = 80
     $queueMediumMax = 400
     if ($queueStrategy -eq "layered") {
@@ -209,10 +204,10 @@ function Run-Custom {
 }
 
 function Run-CommentsGapBackfill {
-    $minComments = Ask-MinCommentsPreset 30
+    $minComments = Ask-MinCommentsPreset 3
     $maxCommentPosts = Ask-Int "max-comment-posts this run (0 = unlimited)" 0 0
     $workers = Ask-Int "workers" 1 1
-    $commentRpm = Ask-Int "comment-rpm" 38 1
+    $commentRpm = Ask-Int "comment-rpm" 100 1
     $queueStrategy = Ask-QueueStrategy "layered"
     $commentIdCache = Ask-CommentIdCache "sqlite"
     $queueSmallMax = 80
@@ -411,11 +406,25 @@ $menu = @(
         Run  = { Invoke-Scraper -ArgsList @("--snapshot") }
     },
     @{
+        Name = "Agent Snapshot"
+        Desc = "save agent metrics snapshot (karma, followers) for time-series analysis"
+        Run  = { Invoke-Scraper -ArgsList @("--agent-snapshot") }
+    },
+    @{
         Name = "Clean runs/"
         Desc = "delete run snapshots; choose keep-last count"
         Run  = {
             $keep = Ask-Int "keep last N run files (0 = delete all)" 5 0
             Invoke-Scraper -ArgsList @("--clean-runs", "$keep")
+        }
+    },
+    @{
+        Name = "Daily Report"
+        Desc = "show growth trends, predictions, and scraping status"
+        Run  = {
+            $runner = Get-Runner
+            $cmd = @($runner.Base[0..($runner.Base.Length-2)] + @("daily_report.py"))
+            & $runner.Cmd @cmd
         }
     },
     @{
