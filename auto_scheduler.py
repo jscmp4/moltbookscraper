@@ -311,6 +311,16 @@ def acquire_lock():
             lock_data = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
             pid = lock_data.get("pid", 0)
             started = lock_data.get("started", "?")
+            # A lock older than the max age is stale regardless of PID liveness:
+            # after a crash (no cleanup) + OS PID reuse, the old PID can look
+            # alive forever and wedge every future run. Longest real run is the
+            # budget (~10h); 24h is safely beyond it.
+            age_stale = False
+            try:
+                _t = datetime.strptime(started, "%Y-%m-%d %H:%M:%S")
+                age_stale = (datetime.now() - _t).total_seconds() > 24 * 3600
+            except Exception:
+                age_stale = False
             # Check if the PID is still alive
             if sys.platform == "win32":
                 import ctypes
@@ -318,17 +328,26 @@ def acquire_lock():
                 handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
                 if handle:
                     kernel32.CloseHandle(handle)
-                    print(f"  [lock] Another scraper is running (PID {pid}, started {started}). Skipping.")
-                    return False
-                # Process is dead, stale lock
-                print(f"  [lock] Stale lock found (PID {pid} no longer running). Removing.")
+                    if not age_stale:
+                        print(f"  [lock] Another scraper is running (PID {pid}, started {started}). Skipping.")
+                        return False
+                    print(f"  [lock] Lock older than 24h (PID {pid}, started {started}); treating as stale. Removing.")
+                else:
+                    # Process is dead, stale lock
+                    print(f"  [lock] Stale lock found (PID {pid} no longer running). Removing.")
             else:
                 import signal
+                alive = True
                 try:
                     os.kill(pid, 0)
+                except OSError:
+                    alive = False
+                if alive and not age_stale:
                     print(f"  [lock] Another scraper is running (PID {pid}, started {started}). Skipping.")
                     return False
-                except OSError:
+                if alive and age_stale:
+                    print(f"  [lock] Lock older than 24h (PID {pid}, started {started}); treating as stale. Removing.")
+                else:
                     print(f"  [lock] Stale lock found (PID {pid} no longer running). Removing.")
         except Exception:
             print(f"  [lock] Corrupt lock file. Removing.")
