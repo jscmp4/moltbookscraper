@@ -471,8 +471,13 @@ def run_scraper(strategy: dict):
                     print(f"  [check] {line.strip()}")
         if check_result.returncode != 0:
             print(f"  [check] WARNING: data check exited with code {check_result.returncode}")
+    except subprocess.TimeoutExpired as e:
+        # A timeout means the daily quality check produced NO output at all.
+        # This failed silently for 29 straight days (2026-06-15..07-14) before
+        # anyone noticed -- keep it loud and greppable.
+        print(f"  [check] ERROR: data check TIMED OUT ({e.timeout:.0f}s) -- no quality check ran today")
     except Exception as e:
-        print(f"  [check] data check failed: {e}")
+        print(f"  [check] ERROR: data check failed: {e}")
 
     # Generate daily report after each run
     try:

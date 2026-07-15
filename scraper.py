@@ -911,6 +911,13 @@ class CommentsIdStore:
                 out[pid] = _to_int(row[1], 0)
         return out
 
+    def total_pairs(self) -> int:
+        """Total unique (post_id, comment_id) pairs in the store."""
+        if self.mode == "sqlite":
+            row = self._conn.execute("SELECT COUNT(*) FROM comment_ids").fetchone()
+            return _to_int(row[0] if row else 0, 0)
+        return sum(len(bucket) for bucket in self._memory.values())
+
     def add_if_new(self, post_id: str, comment_id: str) -> bool:
         if not comment_id:
             return True
@@ -2231,6 +2238,7 @@ def check_data(out: Path, min_comments: int = 1, fast: bool = False, sample_post
     comment_unique_by_post = Counter()
     seen_comment_pairs = set()
     eligible_done_pct = None
+    audit_store_total = None  # unique-pair total from the sqlite audit sync (fast mode)
     scan_stats = {}
     cp_cache_path = out / "checkpoint.json"
     cached_metrics = {}
@@ -2265,7 +2273,7 @@ def check_data(out: Path, min_comments: int = 1, fast: bool = False, sample_post
         if collect_post_ids and fast:
             rows_cached = _to_int(cached_metrics.get("comments_rows"), 0)
             unique_cached = _to_int(cached_metrics.get("comments_unique"), 0)
-            updated_at = str(cached_metrics.get("updated_at", "") or "")
+            updated_at = str(cached_metrics.get("comments_updated_at") or cached_metrics.get("updated_at", "") or "")
             scan_stats[label] = {"rows": rows_cached, "unique": unique_cached}
             print(f"  [{label}] {filename}")
             print(
@@ -2438,6 +2446,11 @@ def check_data(out: Path, min_comments: int = 1, fast: bool = False, sample_post
                             )
                             sample_store.seed_from_comments_file(comments_path, sample_ids)
                             sample_counts = Counter(sample_store.count_for_posts(sample_ids))
+                            # The store is now synced to EOF, so its total is the
+                            # authoritative unique-pair count for the whole file --
+                            # fast mode uses it instead of the (possibly months-old)
+                            # local_metrics_cache for the platform-coverage table.
+                            audit_store_total = sample_store.total_pairs()
                             used_sqlite = True
                             if idx == 1:
                                 print(f"    [sample] using dedicated sqlite cache: {cache_path.name}")
@@ -2633,11 +2646,29 @@ def check_data(out: Path, min_comments: int = 1, fast: bool = False, sample_post
                     n += 1
         return n
 
-    local_posts_rows = scan_stats.get("posts", {}).get("rows", count_jsonl(out / "posts_all.jsonl"))
-    local_posts_unique = scan_stats.get("posts", {}).get("unique", local_posts_rows)
-    local_comments_rows = scan_stats.get("comments", {}).get("rows", count_jsonl(out / "comments_all.jsonl"))
-    local_comments_unique = scan_stats.get("comments", {}).get("unique", local_comments_rows)
-    local_agents_rows = scan_stats.get("agents", {}).get("rows", count_jsonl(out / "agents_seen.jsonl"))
+    # NOTE: dict.get(key, default) evaluates the default EAGERLY — passing
+    # count_jsonl(...) as the default line-counted all ~24GB on every --check
+    # (including --check-fast) and threw the result away. Only fall back to
+    # count_jsonl when the key is genuinely absent (file missing from scan).
+    _posts_stats = scan_stats.get("posts", {})
+    _comments_stats = scan_stats.get("comments", {})
+    _agents_stats = scan_stats.get("agents", {})
+    local_posts_rows = _posts_stats["rows"] if "rows" in _posts_stats else count_jsonl(out / "posts_all.jsonl")
+    local_posts_unique = _posts_stats.get("unique", local_posts_rows)
+    local_comments_rows = _comments_stats["rows"] if "rows" in _comments_stats else count_jsonl(out / "comments_all.jsonl")
+    local_comments_unique = _comments_stats.get("unique", local_comments_rows)
+    local_agents_rows = _agents_stats["rows"] if "rows" in _agents_stats else count_jsonl(out / "agents_seen.jsonl")
+    # In fast mode the comments values above come from local_metrics_cache,
+    # which can be months stale (daily runs hold the scraper lock, so the
+    # writer below never refreshes it). If the sampled audit synced the sqlite
+    # id store to EOF, its total is exact for the current file -- prefer it.
+    comments_from_audit = False
+    if fast and audit_store_total:
+        local_comments_unique = audit_store_total
+        # rows >= unique always holds; a stale cache can undershoot that floor.
+        local_comments_rows = max(local_comments_rows, audit_store_total)
+        comments_from_audit = True
+        print(f"    [fast] comments unique from sqlite id cache (synced to EOF): {audit_store_total:,}")
     # --check is intentionally lock-free, but this is a read-modify-write of
     # checkpoint.json. A live scraper also rewrites checkpoint.json continuously
     # (resume cursor, anchor) via a full-file replace; if we replace it here with
@@ -2659,14 +2690,26 @@ def check_data(out: Path, min_comments: int = 1, fast: bool = False, sample_post
         try:
             with open(cp_cache_path, encoding="utf-8") as f:
                 cp_data = json.load(f)
-            cp_data["local_metrics_cache"] = {
+            _now_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            new_cache = {
                 "posts_rows": local_posts_rows,
                 "posts_unique": local_posts_unique,
                 "comments_rows": local_comments_rows,
                 "comments_unique": local_comments_unique,
                 "agents_rows": local_agents_rows,
-                "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "comments_updated_at": _now_stamp,
+                "updated_at": _now_stamp,
             }
+            if fast and not comments_from_audit:
+                # Comments were neither scanned nor sqlite-derived this run:
+                # carry the old values WITH their old timestamp, so staleness
+                # stays visible instead of being re-stamped as fresh.
+                new_cache["comments_rows"] = _to_int(cached_metrics.get("comments_rows"), 0)
+                new_cache["comments_unique"] = _to_int(cached_metrics.get("comments_unique"), 0)
+                new_cache["comments_updated_at"] = str(
+                    cached_metrics.get("comments_updated_at") or cached_metrics.get("updated_at", "") or ""
+                )
+            cp_data["local_metrics_cache"] = new_cache
             tmp = cp_cache_path.with_suffix(f".metrics.{os.getpid()}.tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(cp_data, f, ensure_ascii=False, indent=2)
