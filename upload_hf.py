@@ -76,6 +76,24 @@ for local_name, remote_name in FILES_TO_UPLOAD:
         print(f"  [!] upload failed for {remote_name}: {e}")
         raise
 
+# 3b) Upload dataset-card figures (small PNGs; unchanged files are no-ops)
+figures_dir = DATA_DIR / "figures"
+if figures_dir.is_dir():
+    print("\n[2b/4] uploading figures/ ...")
+    try:
+        api.upload_folder(
+            folder_path=str(figures_dir),
+            path_in_repo="figures",
+            repo_id=REPO_ID,
+            repo_type="dataset",
+            commit_message="Update dataset-card figures",
+            allow_patterns=["*.png"],
+        )
+        print("  [ok] uploaded figures/")
+    except Exception as e:
+        print(f"  [!] upload failed for figures/: {e}")
+        raise
+
 # 4) Upload agent snapshots folder (incremental: only new/changed files)
 snapshot_dir = DATA_DIR / "agent_snapshots"
 print(f"\n[3/4] uploading agent_snapshots/ ...")
