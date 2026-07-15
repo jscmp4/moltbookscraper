@@ -52,6 +52,24 @@ if sys.platform == "win32":
 BASE_URL = "https://www.moltbook.com/api/v1"
 HEADERS = {"User-Agent": "AcademicResearchBot/2.0 (computational social science)"}
 
+# Safety cap on any single rate-limit / backoff sleep. Server-sent Retry-After
+# or X-RateLimit-Reset can be a far-future HTTP-date or a millisecond-encoded
+# epoch; without a ceiling one bad header would freeze every worker (via the
+# shared global cooldown) for hours-to-years. We cap, then re-check and retry.
+_MAX_RL_WAIT = 600  # seconds (10 min)
+
+# Hard backstop on comment pages fetched per post, to bound an infinite
+# pagination loop if the API returns a non-advancing / cyclic next_cursor.
+# ~1M comments/post — far beyond any real post; the real guard is the
+# next_cursor-did-not-advance check.
+_MAX_COMMENT_PAGES = 10000
+
+# A run lock older than this is treated as stale regardless of PID liveness,
+# so a crash (atexit never fires) followed by OS PID reuse can't wedge the
+# scheduler into refusing every future run. Longest real run is the scheduler
+# budget (~10h); 24h is safely beyond it.
+_MAX_LOCK_AGE_SECONDS = 24 * 3600
+
 # Set when auth is dead platform-wide; checked by both stages so a dead key
 # aborts the run instead of burning hours of futile per-post retries.
 # 401 sets it immediately; 403 only after 3 CONSECUTIVE failures, because a
@@ -217,7 +235,7 @@ def api_get(endpoint, params=None, retries=3, skip_on_ratelimit=False):
             if remaining <= 30 and r.status_code != 429:
                 tqdm.write(f"  [rl] remaining={remaining}/{rl_limit}  reset_in={window_s}s")
             if remaining <= 15 and r.status_code != 429:
-                wait = max(65, reset_ts - time.time() + 2)
+                wait = min(_MAX_RL_WAIT, max(65, reset_ts - time.time() + 2))
                 tqdm.write(f"  [rate limit] remaining={remaining}, wait {wait:.0f}s for reset...")
                 with _global_cooldown_lock:
                     _global_cooldown_until = max(_global_cooldown_until, time.time() + wait)
@@ -234,7 +252,7 @@ def api_get(endpoint, params=None, retries=3, skip_on_ratelimit=False):
                 retry_after = _retry_after_seconds(r, body)
                 wait_to_reset = max(0, _to_int(r.headers.get("X-RateLimit-Reset", 0), 0) - int(time.time()))
                 if retry_after > 0 or wait_to_reset > 0:
-                    wait = max(retry_after, wait_to_reset) + random.uniform(1, 6)
+                    wait = min(_MAX_RL_WAIT, max(retry_after, wait_to_reset) + random.uniform(1, 6))
                 else:
                     base = min(300, 20 * (2 ** attempt))
                     wait = base + random.uniform(0, max(5, base * 0.35))
@@ -893,6 +911,13 @@ class CommentsIdStore:
                 out[pid] = _to_int(row[1], 0)
         return out
 
+    def total_pairs(self) -> int:
+        """Total unique (post_id, comment_id) pairs in the store."""
+        if self.mode == "sqlite":
+            row = self._conn.execute("SELECT COUNT(*) FROM comment_ids").fetchone()
+            return _to_int(row[0] if row else 0, 0)
+        return sum(len(bucket) for bucket in self._memory.values())
+
     def add_if_new(self, post_id: str, comment_id: str) -> bool:
         if not comment_id:
             return True
@@ -915,10 +940,27 @@ class CommentsIdStore:
             )
             inserted = self._conn.total_changes > before
             self._pending += 1
-            if self._pending >= 1000:
+            # NOTE: we deliberately do NOT commit here. The id must not become
+            # durable before its comment row is flushed to JSONL, or a crash
+            # between the two leaves a phantom id (counted as present, never
+            # re-fetched) => permanent silent comment loss. The writer calls
+            # commit() below AFTER flushing the rows.
+            return inserted
+
+    def commit(self, min_pending: int = 1):
+        """Durably persist buffered id inserts. The comment writer calls this
+        AFTER the corresponding rows are flushed to JSONL, so a crash can never
+        leave an id committed without its row on disk (rows are re-indexed from
+        the file on the next run via _sqlite_sync_from_file). Batches by
+        min_pending to bound commit frequency. Assumes a single writer thread
+        (production runs with --workers 1); with more workers the commit is
+        connection-global and the ordering guarantee is best-effort."""
+        if self.mode == "memory" or self._conn is None:
+            return
+        with self._add_lock:
+            if self._pending >= min_pending:
                 self._conn.commit()
                 self._pending = 0
-            return inserted
 
     def close(self):
         if self._conn is not None:
@@ -1033,7 +1075,16 @@ def fetch_posts_incremental(checkpoint: Checkpoint, posts_store: "JsonlStore",
                     newest_post = page_newest
 
             if since_time:
-                new_batch = [p for p in batch if p.get("created_at", "") > since_time]
+                # A blank/missing created_at must NOT be read as "older than the
+                # anchor": `"" > since_time` is False, which would silently drop
+                # the post AND fake an early stop (len(new_batch) < len(batch)),
+                # advancing the anchor past not-yet-fetched newer posts and losing
+                # them forever. Keep such posts; only a PRESENT timestamp that is
+                # <= the anchor is a genuine boundary that should stop the pass.
+                new_batch = [
+                    p for p in batch
+                    if (not p.get("created_at")) or p.get("created_at") > since_time
+                ]
                 if len(new_batch) < len(batch):
                     stopped_early = True
                 batch = new_batch
@@ -1153,7 +1204,9 @@ def _fetch_one_post_comments(post, start_cursor=None, page_progress_cb=None, pag
         else:
             return post, False, cursor, raw_rows_total, written_rows_total, written_unique_total
 
-        flat = _flatten_comments(data.get("comments", []))
+        # `.get("comments", [])` returns None when the key is present but JSON
+        # null; `or []` keeps _flatten_comments from raising on NoneType.
+        flat = _flatten_comments(data.get("comments") or [])
         for c in flat:
             c["post_id"] = post["id"]
             c["post_title"] = post.get("title", "")
@@ -1165,9 +1218,15 @@ def _fetch_one_post_comments(post, start_cursor=None, page_progress_cb=None, pag
                 written_rows_total += max(0, _to_int(wr_rows, 0))
                 written_unique_total += max(0, _to_int(wr_unique, 0))
                 page_written_rows = max(0, _to_int(wr_rows, 0))
-            except Exception:
-                page_written_rows = 0
-                pass
+            except Exception as e:
+                # A page-write failure means this page's rows are NOT durably
+                # stored. Swallowing it and continuing would return success=True,
+                # clear the resume cursor, and (in sqlite mode, where ids were
+                # recorded during the write) leave phantom ids that mask the gap
+                # forever -> permanent silent comment loss. Abort this post,
+                # keeping the current cursor so the page is retried next run.
+                tqdm.write(f"  [!] {post['id'][:8]}... page write failed: {e}; keeping cursor for retry")
+                return post, False, cursor, raw_rows_total, written_rows_total, written_unique_total
         else:
             written_rows_total += len(flat)
             written_unique_total += len(flat)
@@ -1190,7 +1249,17 @@ def _fetch_one_post_comments(post, start_cursor=None, page_progress_cb=None, pag
 
         if not data.get("has_more") or not data.get("next_cursor"):
             break
-        cursor = data["next_cursor"]
+        next_cursor = data["next_cursor"]
+        if next_cursor == cursor:
+            # A cursor that does not advance (but still says has_more) would loop
+            # forever, re-fetching the same page, wedging this worker and — via
+            # as_completed — the whole comments stage. Stop instead.
+            tqdm.write(f"  [!] {post['id'][:8]}... next_cursor did not advance (p{page}); stopping to avoid an infinite loop.")
+            break
+        if page >= _MAX_COMMENT_PAGES:
+            tqdm.write(f"  [!] {post['id'][:8]}... hit page cap {_MAX_COMMENT_PAGES} (possible cursor cycle); stopping.")
+            break
+        cursor = next_cursor
 
     return post, True, None, raw_rows_total, written_rows_total, written_unique_total
 
@@ -1629,6 +1698,10 @@ def fetch_comments_for_posts(posts_store: "JsonlStore", comments_path: Path,
             run_file.flush()
             total_new_rows += len(to_write)
             total_new_unique += unique_added
+        # Rows are now durable; only NOW let the ids recorded by add_if_new above
+        # commit. A crash before this rolls the ids back (rows re-index from the
+        # file next run) — never a phantom id. Batched to ~1000 to bound commits.
+        id_store.commit(min_pending=1000)
         return len(to_write), unique_added
 
     try:
@@ -2165,6 +2238,7 @@ def check_data(out: Path, min_comments: int = 1, fast: bool = False, sample_post
     comment_unique_by_post = Counter()
     seen_comment_pairs = set()
     eligible_done_pct = None
+    audit_store_total = None  # unique-pair total from the sqlite audit sync (fast mode)
     scan_stats = {}
     cp_cache_path = out / "checkpoint.json"
     cached_metrics = {}
@@ -2199,7 +2273,7 @@ def check_data(out: Path, min_comments: int = 1, fast: bool = False, sample_post
         if collect_post_ids and fast:
             rows_cached = _to_int(cached_metrics.get("comments_rows"), 0)
             unique_cached = _to_int(cached_metrics.get("comments_unique"), 0)
-            updated_at = str(cached_metrics.get("updated_at", "") or "")
+            updated_at = str(cached_metrics.get("comments_updated_at") or cached_metrics.get("updated_at", "") or "")
             scan_stats[label] = {"rows": rows_cached, "unique": unique_cached}
             print(f"  [{label}] {filename}")
             print(
@@ -2372,6 +2446,11 @@ def check_data(out: Path, min_comments: int = 1, fast: bool = False, sample_post
                             )
                             sample_store.seed_from_comments_file(comments_path, sample_ids)
                             sample_counts = Counter(sample_store.count_for_posts(sample_ids))
+                            # The store is now synced to EOF, so its total is the
+                            # authoritative unique-pair count for the whole file --
+                            # fast mode uses it instead of the (possibly months-old)
+                            # local_metrics_cache for the platform-coverage table.
+                            audit_store_total = sample_store.total_pairs()
                             used_sqlite = True
                             if idx == 1:
                                 print(f"    [sample] using dedicated sqlite cache: {cache_path.name}")
@@ -2567,24 +2646,71 @@ def check_data(out: Path, min_comments: int = 1, fast: bool = False, sample_post
                     n += 1
         return n
 
-    local_posts_rows = scan_stats.get("posts", {}).get("rows", count_jsonl(out / "posts_all.jsonl"))
-    local_posts_unique = scan_stats.get("posts", {}).get("unique", local_posts_rows)
-    local_comments_rows = scan_stats.get("comments", {}).get("rows", count_jsonl(out / "comments_all.jsonl"))
-    local_comments_unique = scan_stats.get("comments", {}).get("unique", local_comments_rows)
-    local_agents_rows = scan_stats.get("agents", {}).get("rows", count_jsonl(out / "agents_seen.jsonl"))
-    if cp_cache_path.exists():
+    # NOTE: dict.get(key, default) evaluates the default EAGERLY — passing
+    # count_jsonl(...) as the default line-counted all ~24GB on every --check
+    # (including --check-fast) and threw the result away. Only fall back to
+    # count_jsonl when the key is genuinely absent (file missing from scan).
+    _posts_stats = scan_stats.get("posts", {})
+    _comments_stats = scan_stats.get("comments", {})
+    _agents_stats = scan_stats.get("agents", {})
+    local_posts_rows = _posts_stats["rows"] if "rows" in _posts_stats else count_jsonl(out / "posts_all.jsonl")
+    local_posts_unique = _posts_stats.get("unique", local_posts_rows)
+    local_comments_rows = _comments_stats["rows"] if "rows" in _comments_stats else count_jsonl(out / "comments_all.jsonl")
+    local_comments_unique = _comments_stats.get("unique", local_comments_rows)
+    local_agents_rows = _agents_stats["rows"] if "rows" in _agents_stats else count_jsonl(out / "agents_seen.jsonl")
+    # In fast mode the comments values above come from local_metrics_cache,
+    # which can be months stale (daily runs hold the scraper lock, so the
+    # writer below never refreshes it). If the sampled audit synced the sqlite
+    # id store to EOF, its total is exact for the current file -- prefer it.
+    comments_from_audit = False
+    if fast and audit_store_total:
+        local_comments_unique = audit_store_total
+        # rows >= unique always holds; a stale cache can undershoot that floor.
+        local_comments_rows = max(local_comments_rows, audit_store_total)
+        comments_from_audit = True
+        print(f"    [fast] comments unique from sqlite id cache (synced to EOF): {audit_store_total:,}")
+    # --check is intentionally lock-free, but this is a read-modify-write of
+    # checkpoint.json. A live scraper also rewrites checkpoint.json continuously
+    # (resume cursor, anchor) via a full-file replace; if we replace it here with
+    # our stale snapshot we clobber its just-advanced crawl state (-> re-crawl or
+    # silently skipped window) or, sharing the same tmp name, produce corrupt
+    # JSON. So only persist the metrics cache when NO live scraper holds the
+    # lock, and use a private tmp name to avoid any tmp collision.
+    _live_lock = out / "scraper.lock"
+    _scrape_running = False
+    try:
+        if _live_lock.exists():
+            _ld = json.loads(_live_lock.read_text(encoding="utf-8"))
+            _scrape_running = _pid_alive(_to_int(_ld.get("pid"), 0))
+    except Exception:
+        _scrape_running = False
+    if cp_cache_path.exists() and _scrape_running:
+        print("    [i] a scrape is running; skipping local_metrics_cache write to protect checkpoint.json.")
+    elif cp_cache_path.exists():
         try:
             with open(cp_cache_path, encoding="utf-8") as f:
                 cp_data = json.load(f)
-            cp_data["local_metrics_cache"] = {
+            _now_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            new_cache = {
                 "posts_rows": local_posts_rows,
                 "posts_unique": local_posts_unique,
                 "comments_rows": local_comments_rows,
                 "comments_unique": local_comments_unique,
                 "agents_rows": local_agents_rows,
-                "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "comments_updated_at": _now_stamp,
+                "updated_at": _now_stamp,
             }
-            tmp = cp_cache_path.with_suffix(".tmp")
+            if fast and not comments_from_audit:
+                # Comments were neither scanned nor sqlite-derived this run:
+                # carry the old values WITH their old timestamp, so staleness
+                # stays visible instead of being re-stamped as fresh.
+                new_cache["comments_rows"] = _to_int(cached_metrics.get("comments_rows"), 0)
+                new_cache["comments_unique"] = _to_int(cached_metrics.get("comments_unique"), 0)
+                new_cache["comments_updated_at"] = str(
+                    cached_metrics.get("comments_updated_at") or cached_metrics.get("updated_at", "") or ""
+                )
+            cp_data["local_metrics_cache"] = new_cache
+            tmp = cp_cache_path.with_suffix(f".metrics.{os.getpid()}.tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(cp_data, f, ensure_ascii=False, indent=2)
             tmp.replace(cp_cache_path)
@@ -2646,6 +2772,18 @@ def check_data(out: Path, min_comments: int = 1, fast: bool = False, sample_post
 _LOCK_INHERITED_ENV = "MOLT_LOCK_INHERITED"
 
 
+def _lock_is_stale_by_age(started: str) -> bool:
+    """A lock older than _MAX_LOCK_AGE_SECONDS is stale regardless of PID
+    liveness. Without this, a crash (atexit never fires on SIGKILL / power loss)
+    plus OS PID reuse makes a dead run's lock look alive forever, so every future
+    run refuses to start and the corpus silently stops growing."""
+    try:
+        t = datetime.strptime(started, "%Y-%m-%d %H:%M:%S")
+        return (datetime.now() - t).total_seconds() > _MAX_LOCK_AGE_SECONDS
+    except Exception:
+        return False
+
+
 def _pid_alive(pid: int) -> bool:
     if not pid:
         return False
@@ -2693,10 +2831,14 @@ def acquire_scraper_lock(lock_path: Path) -> bool:
                 started = lock_data.get("started", "?")
             except Exception:
                 pid, started = 0, "?"
-            if _pid_alive(pid):
+            age_stale = _lock_is_stale_by_age(started)
+            if _pid_alive(pid) and not age_stale:
                 print(f"  [lock] another scraper is running (PID {pid}, started {started}); refusing to start.")
                 return False
-            print(f"  [lock] stale lock (PID {pid} not running); removing.")
+            if age_stale:
+                print(f"  [lock] lock older than {_MAX_LOCK_AGE_SECONDS // 3600}h (started {started}); treating as stale, removing.")
+            else:
+                print(f"  [lock] stale lock (PID {pid} not running); removing.")
             try:
                 lock_path.unlink()
             except OSError:
